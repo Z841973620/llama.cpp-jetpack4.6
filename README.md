@@ -3,6 +3,7 @@
 ![IMG](./IMG.png)
 
 基于 llama.cpp b4262，更新的版本会提示 ```Target "ggml-cuda" requires the language dialect "CUDA17" (with compiler extensions), but CMake does not know the compile flags to use to enable it.```
+
 已修正 ggml-cuda 错误 ```identifier "__builtin_assume" is undefined``` 和 ``` A __device__ variable cannot be marked constexpr```
 
 需从源码构建 gcc-8.5，默认自带的 gcc-7 缺少功能 ```vld1q_s8_x4```
