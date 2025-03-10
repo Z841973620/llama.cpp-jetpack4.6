@@ -19,7 +19,7 @@ make && make install
 ```
 ```
 # compile llama.cpp for sm_53, sm_62 and sm_72
-git clone https://github.com/Z841973620/llama.cpp-tegra.git && cd llama.cpp
+git clone https://github.com/Z841973620/llama.cpp-tegra.git && cd llama.cpp-tegra/llama.cpp
 cmake -B build -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=ON -DLLAMA_CUDA=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="53;62;72" -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_FLAGS="-std=c++17 -lstdc++fs"
 cmake --build build --config Release -j --target llama-server llama-cli
 ```
