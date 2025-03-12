@@ -1309,7 +1309,8 @@ void llm_load_vocab(llama_model_loader & ml, llama_model & model) {
                 vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_COMMAND_R;
                 vocab.tokenizer_clean_spaces = false;
             } else if (
-                tokenizer_pre == "qwen2") {
+                tokenizer_pre == "qwen2" ||
+		tokenizer_pre == "deepseek-r1-qwen") {
                 vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_QWEN2;
                 vocab.tokenizer_clean_spaces = false;
             } else if (

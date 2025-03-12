@@ -10,6 +10,8 @@
 - ``` A __device__ variable cannot be marked constexpr```
 - ```ggml/src/ggml-cuda/concat.cu(193): error: "auto" is not allowed here```
 
+已添加 ```deepseek-r1-qwen``` 支持
+
 需从源码构建 gcc-8.5，默认自带的 gcc-7 缺少功能 ```vld1q_s8_x4```
 
 编译 llama.cpp 使用 cmake-3.22.1
