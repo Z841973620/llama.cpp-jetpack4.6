@@ -23,6 +23,7 @@ from typing import (
     Set,
 )
 from re import RegexFlag
+import wget
 
 
 class ServerResponse:
@@ -64,6 +65,8 @@ class ServerProcess:
     server_embeddings: bool | None = False
     server_reranking: bool | None = False
     server_metrics: bool | None = False
+    server_slots: bool | None = False
+    pooling: str | None = None
     draft: int | None = None
     api_key: str | None = None
     response_format: str | None = None
@@ -71,6 +74,8 @@ class ServerProcess:
     disable_ctx_shift: int | None = False
     draft_min: int | None = None
     draft_max: int | None = None
+    no_webui: bool | None = None
+    chat_template: str | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -91,7 +96,6 @@ class ServerProcess:
         else:
             server_path = "../../../build/bin/llama-server"
         server_args = [
-            "--slots",  # requires to get slot status via /slots endpoint
             "--host",
             self.server_host,
             "--port",
@@ -129,6 +133,10 @@ class ServerProcess:
             server_args.append("--reranking")
         if self.server_metrics:
             server_args.append("--metrics")
+        if self.server_slots:
+            server_args.append("--slots")
+        if self.pooling:
+            server_args.extend(["--pooling", self.pooling])
         if self.model_alias:
             server_args.extend(["--alias", self.model_alias])
         if self.n_ctx:
@@ -156,6 +164,10 @@ class ServerProcess:
             server_args.extend(["--draft-max", self.draft_max])
         if self.draft_min:
             server_args.extend(["--draft-min", self.draft_min])
+        if self.no_webui:
+            server_args.append("--no-webui")
+        if self.chat_template:
+            server_args.extend(["--chat-template", self.chat_template])
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"bench: starting server with: {' '.join(args)}")
@@ -181,7 +193,7 @@ class ServerProcess:
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
             try:
-                response = self.make_request("GET", "/slots", headers={
+                response = self.make_request("GET", "/health", headers={
                     "Authorization": f"Bearer {self.api_key}" if self.api_key else None
                 })
                 if response.status_code == 200:
@@ -224,7 +236,7 @@ class ServerProcess:
         result.headers = dict(response.headers)
         result.status_code = response.status_code
         result.body = response.json() if parse_body else None
-        print("Response from server", result.body)
+        print("Response from server", json.dumps(result.body, indent=2))
         return result
 
     def make_stream_request(
@@ -245,7 +257,7 @@ class ServerProcess:
                 break
             elif line.startswith('data: '):
                 data = json.loads(line[6:])
-                print("Partial response from server", data)
+                print("Partial response from server", json.dumps(data, indent=2))
                 yield data
 
 
@@ -369,3 +381,26 @@ def match_regex(regex: str, text: str) -> bool:
         ).search(text)
         is not None
     )
+
+
+def download_file(url: str, output_file_path: str | None = None) -> str:
+    """
+    Download a file from a URL to a local path. If the file already exists, it will not be downloaded again.
+
+    output_file_path is the local path to save the downloaded file. If not provided, the file will be saved in the root directory.
+
+    Returns the local path of the downloaded file.
+    """
+    file_name = url.split('/').pop()
+    output_file = f'./tmp/{file_name}' if output_file_path is None else output_file_path
+    if not os.path.exists(output_file):
+        print(f"Downloading {url} to {output_file}")
+        wget.download(url, out=output_file)
+        print(f"Done downloading to {output_file}")
+    else:
+        print(f"File already exists at {output_file}")
+    return output_file
+
+
+def is_slow_test_allowed():
+    return os.environ.get("SLOW_TESTS") == "1" or os.environ.get("SLOW_TESTS") == "ON"
