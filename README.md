@@ -2,15 +2,7 @@
 
 ![IMG](./IMG.png)
 
-基于 llama.cpp b4418，更高的版本具有 bf16 支持，无法在 cuda10.2 环境编译
-
-已修正以下编译错误：
-- ```Target "ggml-cuda" requires the language dialect "CUDA17" (with compiler extensions), but CMake does not know the compile flags to use to enable it.```
-- ```identifier "__builtin_assume" is undefined```
-- ``` A __device__ variable cannot be marked constexpr```
-- ```ggml/src/ggml-cuda/concat.cu(193): error: "auto" is not allowed here```
-
-已添加 ```deepseek-r1-qwen``` 支持
+基于 llama.cpp b4792，删除了 bf16 支持以在 cuda10.2 环境编译
 
 需从源码构建 gcc-8.5，默认自带的 gcc-7 缺少功能 ```vld1q_s8_x4```
 
