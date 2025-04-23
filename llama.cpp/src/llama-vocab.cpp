@@ -1839,6 +1839,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 if (false
                         || t.first == "<|fim_prefix|>"  // Qwen
                         || t.first == "<fim-prefix>"
+                        || t.first == "<fim_prefix>"    // Granite
                         || t.first == "<｜fim▁begin｜>" // DeepSeek
                         || t.first == "<PRE>"
                         || t.first == "▁<PRE>"          // CodeLlama
@@ -1857,6 +1858,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 if (false
                         || t.first == "<|fim_suffix|>" // Qwen
                         || t.first == "<fim-suffix>"
+                        || t.first == "<fim_suffix>"   // Granite
                         || t.first == "<｜fim▁hole｜>" // DeepSeek
                         || t.first == "<SUF>"
                         || t.first == "▁<SUF>"         // CodeLlama
@@ -1875,6 +1877,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 if (false
                         || t.first == "<|fim_middle|>" // Qwen
                         || t.first == "<fim-middle>"
+                        || t.first == "<fim_middle>"   // Granite
                         || t.first == "<｜fim▁end｜>"  // DeepSeek
                         || t.first == "<MID>"
                         || t.first == "▁<MID>"         // CodeLlama
@@ -1893,6 +1896,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 if (false
                         || t.first == "<|fim_pad|>" // Qwen
                         || t.first == "<fim-pad>"
+                        || t.first == "<fim_pad>"   // Granite
                         || t.first == "<PAD>"
                         ) {
                     special_fim_pad_id = t.second;
@@ -1909,6 +1913,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 if (false
                         || t.first == "<|fim_repo|>"  // Qwen
                         || t.first == "<|repo_name|>"
+                        || t.first == "<reponame>"    // Granite
                         || t.first == "<fim-repo>"
                         || t.first == "<REPO>"
                         ) {
