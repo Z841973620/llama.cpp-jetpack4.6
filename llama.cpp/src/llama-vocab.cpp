@@ -1916,9 +1916,9 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 if (false
                         || t.first == "<|fim_repo|>"  // Qwen
                         || t.first == "<|repo_name|>"
-                        || t.first == "<reponame>"    // Granite
                         || t.first == "<fim-repo>"
                         || t.first == "<REPO>"
+                        || t.first == "<reponame>"    // Granite
                         ) {
                     special_fim_rep_id = t.second;
                     if ((id_to_token[t.second].attr & LLAMA_TOKEN_ATTR_CONTROL) == 0) {
