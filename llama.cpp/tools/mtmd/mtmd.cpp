@@ -42,6 +42,7 @@ enum mtmd_slice_tmpl {
     MTMD_SLICE_TMPL_NONE,
     MTMD_SLICE_TMPL_MINICPMV_2_5,
     MTMD_SLICE_TMPL_MINICPMV_2_6,
+    MTMD_SLICE_TMPL_LLAMA4,
     // TODO @ngxson : add support for idefics (SmolVLM)
 };
 
@@ -64,15 +65,19 @@ struct mtmd_context {
     int n_threads;
     std::string image_marker;
 
-    // for minicpmv, we need special tokens in-between slices
+    // for llava-uhd style models, we need special tokens in-between slices
+    // minicpmv calls them "slices", llama 4 calls them "tiles"
     mtmd_slice_tmpl slice_tmpl    = MTMD_SLICE_TMPL_NONE;
     llama_token tok_ov_img_start  = LLAMA_TOKEN_NULL; // overview image
     llama_token tok_ov_img_end    = LLAMA_TOKEN_NULL; // overview image
     llama_token tok_slices_start  = LLAMA_TOKEN_NULL; // start of all slices
     llama_token tok_slices_end    = LLAMA_TOKEN_NULL; // end of all slices
-    llama_token tok_sli_img_start = LLAMA_TOKEN_NULL; // single slice
-    llama_token tok_sli_img_end   = LLAMA_TOKEN_NULL; // single slice
+    llama_token tok_sli_img_start = LLAMA_TOKEN_NULL; // single slice start
+    llama_token tok_sli_img_end   = LLAMA_TOKEN_NULL; // single slice end
+    llama_token tok_sli_img_mid   = LLAMA_TOKEN_NULL; // between 2 slices
     llama_token tok_row_end       = LLAMA_TOKEN_NULL; // end of row
+    bool        tok_row_end_trail = false;
+    bool        ov_img_first      = false;
 
     bool use_mrope = false; // for Qwen2VL, we need to use M-RoPE
 
@@ -96,6 +101,7 @@ struct mtmd_context {
 
         use_mrope = clip_is_qwen2vl(ctx_clip);
 
+        projector_type proj = clip_get_projector_type(ctx_clip);
         int minicpmv_version = clip_is_minicpmv(ctx_clip);
         if (minicpmv_version == 2) {
             // minicpmv 2.5 format:
@@ -108,6 +114,8 @@ struct mtmd_context {
             tok_sli_img_start = tok_ov_img_start;
             tok_sli_img_end   = tok_ov_img_end;
             tok_row_end       = lookup_token("\n");
+            tok_row_end_trail = false; // no trailing end-of-row token
+            ov_img_first      = true;
 
         } else if (minicpmv_version == 3 || minicpmv_version == 4) {
             // minicpmv 2.6 format:
@@ -118,9 +126,25 @@ struct mtmd_context {
             tok_sli_img_start = lookup_token("<slice>");
             tok_sli_img_end   = lookup_token("</slice>");
             tok_row_end       = lookup_token("\n");
+            tok_row_end_trail = false; // no trailing end-of-row token
+            ov_img_first      = true;
 
         } else if (minicpmv_version != 0) {
             GGML_ASSERT(false && "unsupported minicpmv version");
+        } else if (proj == PROJECTOR_TYPE_LLAMA4) {
+            // llama 4 format:
+            // <|image_start|>
+            //     (slice) <|tile_x_separator|> (slice) <|tile_x_separator|> ... <|tile_y_separator|>
+            //     (slice) <|tile_x_separator|> (slice) <|tile_x_separator|> ... <|tile_y_separator|>
+            //     ... <|tile_y_separator|>   <-- trailing end-of-row token
+            // <|image|> (overview)           <-- overview image is last
+            // <|image_end|>
+            slice_tmpl        = MTMD_SLICE_TMPL_LLAMA4;
+            tok_ov_img_start  = lookup_token("<|image|>");
+            tok_sli_img_mid   = lookup_token("<|tile_x_separator|>");
+            tok_row_end       = lookup_token("<|tile_y_separator|>");
+            tok_row_end_trail = true; // add trailing end-of-row token
+            ov_img_first      = false; // overview image is last
         }
     }
 
@@ -243,16 +267,18 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
         // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
         marker_modified = ctx->image_marker + "[IMG_END]";
         string_replace_all(prompt_modified, ctx->image_marker, marker_modified);
-    }
 
-    else if (proj_type == PROJECTOR_TYPE_QWEN2VL || proj_type == PROJECTOR_TYPE_QWEN25VL) {
+    } else if (proj_type == PROJECTOR_TYPE_QWEN2VL || proj_type == PROJECTOR_TYPE_QWEN25VL) {
         // <|vision_start|> ... (image embeddings) ... <|vision_end|>
         marker_modified = "<|vision_start|>" + ctx->image_marker + "<|vision_end|>";
         string_replace_all(prompt_modified, ctx->image_marker, marker_modified);
 
-    }
+    } else if (proj_type == PROJECTOR_TYPE_LLAMA4) {
+        // (more details in mtmd_context constructor)
+        marker_modified = "<|image_start|>" + ctx->image_marker + "<|image_end|>";
+        string_replace_all(prompt_modified, ctx->image_marker, marker_modified);
 
-    else if (proj_type == PROJECTOR_TYPE_INTERNVL) {
+    } else if (proj_type == PROJECTOR_TYPE_INTERNVL) {
         // <img> ... (image embeddings) ... </img>
         marker_modified = "<img>" + ctx->image_marker + "</img>";
         string_replace_all(prompt_modified, ctx->image_marker, marker_modified);
@@ -328,7 +354,6 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
             img_u8->ny = bitmaps[i_img]->ny;
             img_u8->buf.resize(bitmaps[i_img]->data.size());
             std::memcpy(img_u8->buf.data(), bitmaps[i_img]->data.data(), img_u8->nx * img_u8->ny * 3);
-            clip_image_size img_u8_size{img_u8->nx, img_u8->ny};
 
             // preprocess image
             clip_image_f32_batch batch_f32;
@@ -338,28 +363,40 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
                 return 2;
             }
 
-            if (ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_5 || ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_6) {
+            // handle llava-uhd style preprocessing
+            if (
+                ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_5
+                || ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_6
+                || ctx->slice_tmpl == MTMD_SLICE_TMPL_LLAMA4
+            ) {
                 // split batch into chunks of single images
                 auto chunks = split_batch_to_chunk(std::move(batch_f32), bitmaps[i_img]->id);
                 GGML_ASSERT(chunks.size() > 0);
 
-                // add overview image
-                add_text_chunk({ctx->tok_ov_img_start});
-                output->entries.emplace_back(std::move(chunks.front()));
+                auto ov_chunk = std::move(chunks.front());
                 chunks.erase(chunks.begin());
-                add_text_chunk({ctx->tok_ov_img_end});
 
-                // add slices
+                // add overview image (first)
+                if (ctx->ov_img_first) {
+                    if (ctx->tok_ov_img_start != LLAMA_TOKEN_NULL) {
+                        add_text_chunk({ctx->tok_ov_img_start});
+                    }
+                    output->entries.emplace_back(std::move(ov_chunk));
+                    if (ctx->tok_ov_img_end != LLAMA_TOKEN_NULL) {
+                        add_text_chunk({ctx->tok_ov_img_end});
+                    }
+                }
+
+                // add slices (or tiles)
                 if (!chunks.empty()) {
-                    clip_add_load_image_size(ctx->ctx_clip, &img_u8_size);
-                    int n_col = clip_uhd_num_image_embeds_col(ctx->ctx_clip);
-                    int n_row = (int)chunks.size() / n_col;
-                    GGML_ASSERT(n_row * n_col == (int)chunks.size());
+                    const int n_col = batch_f32.grid_x;
+                    const int n_row = batch_f32.grid_y;
                     if (ctx->tok_slices_start != LLAMA_TOKEN_NULL) {
                         add_text_chunk({ctx->tok_slices_start});
                     }
                     for (int y = 0; y < n_row; y++) {
                         for (int x = 0; x < n_col; x++) {
+                            const bool is_last_in_row = (x == n_col - 1);
                             if (ctx->tok_sli_img_start != LLAMA_TOKEN_NULL) {
                                 add_text_chunk({ctx->tok_sli_img_start});
                             }
@@ -367,13 +404,27 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
                             if (ctx->tok_sli_img_end != LLAMA_TOKEN_NULL) {
                                 add_text_chunk({ctx->tok_sli_img_end});
                             }
+                            if (!is_last_in_row && ctx->tok_sli_img_mid != LLAMA_TOKEN_NULL) {
+                                add_text_chunk({ctx->tok_sli_img_mid});
+                            }
                         }
-                        if (ctx->tok_row_end != LLAMA_TOKEN_NULL && y != n_row - 1) {
+                        if ((y != n_row - 1 || ctx->tok_row_end_trail) && ctx->tok_row_end != LLAMA_TOKEN_NULL) {
                             add_text_chunk({ctx->tok_row_end});
                         }
                     }
                     if (ctx->tok_slices_end != LLAMA_TOKEN_NULL) {
                         add_text_chunk({ctx->tok_slices_end});
+                    }
+                }
+
+                // add overview image (last)
+                if (!ctx->ov_img_first) {
+                    if (ctx->tok_ov_img_start != LLAMA_TOKEN_NULL) {
+                        add_text_chunk({ctx->tok_ov_img_start});
+                    }
+                    output->entries.emplace_back(std::move(ov_chunk));
+                    if (ctx->tok_ov_img_end != LLAMA_TOKEN_NULL) {
+                        add_text_chunk({ctx->tok_ov_img_end});
                     }
                 }
 
@@ -427,14 +478,6 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
     ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
     bool ok = false;
 
-    // only effective for minicpmv and qwen2vl, other models will ignore load_image_size
-    {
-        clip_image_size slice_size{
-            image_tokens->batch_f32.entries[0]->nx,
-            image_tokens->batch_f32.entries[0]->ny};
-        clip_add_load_image_size(ctx->ctx_clip, &slice_size);
-    }
-
     if (clip_is_llava(ctx->ctx_clip) || clip_is_minicpmv(ctx->ctx_clip) || clip_is_glm(ctx->ctx_clip)) {
         // TODO @ngxson : llava does not support batched encoding ; this should be fixed inside clip_image_batch_encode()
         const auto & entries = image_tokens->batch_f32.entries;
@@ -461,307 +504,26 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
 }
 
-size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks) {
-    size_t n_tokens = 0;
-    for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
-        auto chunk = mtmd_input_chunks_get(chunks, i);
-        auto chunk_type = mtmd_input_chunk_get_type(chunk);
-        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-            size_t n_tokens_text;
-            mtmd_input_chunk_get_tokens_text(chunk, &n_tokens_text);
-            n_tokens += n_tokens_text;
-        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-            auto tokens_image = mtmd_input_chunk_get_tokens_image(chunk);
-            n_tokens += mtmd_image_tokens_get_n_tokens(tokens_image);
-        } else {
-            GGML_ASSERT(false && "chunk type not supported");
-        }
+bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
+    projector_type proj_type = clip_get_projector_type(ctx->ctx_clip);
+    if (proj_type == PROJECTOR_TYPE_GEMMA3) {
+        return true;
     }
-    return n_tokens;
+    return false;
 }
 
-llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks * chunks) {
-    llama_pos n_pos = 0;
-    for (size_t i = 0; i < mtmd_input_chunks_size(chunks); i++) {
-        auto chunk = mtmd_input_chunks_get(chunks, i);
-        auto chunk_type = mtmd_input_chunk_get_type(chunk);
-        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-            size_t n_tokens_text;
-            mtmd_input_chunk_get_tokens_text(chunk, &n_tokens_text);
-            n_pos += n_tokens_text;
-        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-            auto tokens_image = mtmd_input_chunk_get_tokens_image(chunk);
-            n_pos += mtmd_image_tokens_get_n_pos(tokens_image);
-        } else {
-            GGML_ASSERT(false && "chunk type not supported");
-        }
-    }
-    return n_pos;
+bool mtmd_decode_use_mrope(mtmd_context * ctx) {
+    return ctx->use_mrope;
 }
 
-// helper struct to make working with embd batch easier
-// note: this will be removed after llama_batch_ext refactoring
-struct decode_embd_batch {
-    int n_pos_per_embd;
-    int n_mmproj_embd;
-    std::vector<llama_pos>      pos;
-    std::vector<llama_pos>      pos_view; // used by mrope
-    std::vector<int32_t>        n_seq_id;
-    std::vector<llama_seq_id>   seq_id_0;
-    std::vector<llama_seq_id *> seq_ids;
-    std::vector<int8_t>         logits;
-    llama_batch batch;
-    decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
-        pos     .resize(n_tokens * n_pos_per_embd);
-        n_seq_id.resize(n_tokens);
-        seq_ids .resize(n_tokens + 1);
-        logits  .resize(n_tokens);
-        seq_id_0.resize(1);
-        seq_ids [n_tokens] = nullptr;
-        batch = {
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ embd,
-            /*pos            =*/ pos.data(),
-            /*n_seq_id       =*/ n_seq_id.data(),
-            /*seq_id         =*/ seq_ids.data(),
-            /*logits         =*/ logits.data(),
-        };
-    }
-
-    void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
-        seq_id_0[0] = seq_id;
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.pos     [i] = pos_0 + i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    void set_position_mrope(llama_pos pos_0, int nx, int ny, llama_seq_id seq_id) {
-        GGML_ASSERT(n_pos_per_embd == 4);
-        seq_id_0[0] = seq_id;
-        for (int y = 0; y < ny; y++) {
-            for (int x = 0; x < nx; x++) {
-                int i = y * nx + x;
-                pos[i                     ] = pos_0;
-                pos[i + batch.n_tokens    ] = pos_0 + y;
-                pos[i + batch.n_tokens * 2] = pos_0 + x;
-                pos[i + batch.n_tokens * 3] = 0; // last pos dim is unused
-            }
-        }
-        for (int i = 0; i < batch.n_tokens; i++) {
-            batch.n_seq_id[i] = 1;
-            batch.seq_id  [i] = seq_id_0.data();
-            batch.logits  [i] = false;
-        }
-    }
-
-    llama_batch get_view(int offset, int n_tokens) {
-        llama_pos * pos_ptr;
-        pos_view.clear();
-        pos_view.reserve(n_tokens * n_pos_per_embd);
-        if (n_pos_per_embd > 1) {
-            // mrope
-            // for example, with layout of src: 1234...1234...1234...1234...
-            //       offset 2 will give us dst: 34...34...34...34...
-            for (int i = 0; i < n_pos_per_embd; i++) {
-                // assume n_tokens is less than or equal to batch.n_tokens
-                // batch.n_tokens is number of **total** tokens
-                // n_tokens is number of viewed token
-                size_t src_idx = i * batch.n_tokens + offset;
-                pos_view.insert(pos_view.end(),
-                    pos.data() + src_idx,
-                    pos.data() + src_idx + n_tokens);
-            }
-            pos_ptr = pos_view.data();
-        } else {
-            // normal
-            pos_ptr = pos.data() + offset;
-        }
-        return {
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ batch.embd     + offset * n_mmproj_embd,
-            /*pos            =*/ pos_ptr,
-            /*n_seq_id       =*/ batch.n_seq_id + offset,
-            /*seq_id         =*/ batch.seq_id   + offset,
-            /*logits         =*/ batch.logits   + offset,
-        };
-    }
-};
-
-// Helper function for decoding an image whose embeddings have already been calculated
-int32_t mtmd_helper_decode_image_chunk(
-        mtmd_context * ctx,
-        struct llama_context * lctx,
-        const mtmd_input_chunk * chunk,
-        float * encoded_embd,
-        llama_pos n_past,
-        llama_seq_id seq_id,
-        int32_t n_batch,
-        llama_pos * new_n_past) {
-    if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-        LOG_ERR("failed to decode image chunk: input chunk not of image type\n");
-        return -1;
-    }
-    const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
-    if (!image_tokens) {
-        LOG_ERR("failed to decode image chunk: image tokens are null\n");
-        return -1;
-    }
-
-    int n_mmproj_embd = clip_n_mmproj_embd(ctx->ctx_clip);
-    int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
-
-    int32_t n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
-    int32_t i_batch = 0;
-    int32_t n_img_batches = GGML_PAD(n_tokens, n_batch) / n_batch;
-    decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
-
-    const int nx = mtmd_image_tokens_get_nx(image_tokens);
-    const int ny = mtmd_image_tokens_get_ny(image_tokens);
-
-    if (mtmd_decode_use_mrope(ctx)) {
-        batch_embd.set_position_mrope(n_past, nx, ny, seq_id);
-    } else {
-        batch_embd.set_position_normal(n_past, seq_id);
-    }
-
-    if (mtmd_decode_use_non_causal(ctx)) {
-        llama_set_causal_attn(lctx, false);
-        // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
-    }
-
-    while (i_batch < n_img_batches) { // split into batches
-        int pos_offset = i_batch*n_batch;
-        int n_tokens_batch = std::min(n_batch, n_tokens - pos_offset);
-        llama_batch batch_embd_view = batch_embd.get_view(pos_offset, n_tokens_batch);
-
-        LOG_INF("decoding image batch %d/%d, n_tokens_batch = %d\n", i_batch+1, n_img_batches, n_tokens_batch);
-
-        int64_t t1 = ggml_time_ms();
-        int32_t ret = llama_decode(lctx, batch_embd_view);
-        if (ret != 0) {
-            LOG_ERR("failed to decode image\n");
-            llama_set_causal_attn(lctx, true); // restore causal attn
-            return ret;
-        }
-
-        if (ctx->print_timings) {
-            LOG_INF("image decoded (batch %d/%d) in %" PRId64 " ms\n", i_batch+1, n_img_batches, ggml_time_ms() - t1);
-        }
-
-        i_batch++;
-    }
-
-    n_past += mtmd_image_tokens_get_n_pos(image_tokens);
-    *new_n_past = n_past;
-
-    if (mtmd_decode_use_non_causal(ctx)) {
-        llama_set_causal_attn(lctx, true);
-    }
-    return 0;
+void mtmd_image_tokens_deleter::operator()(mtmd_image_tokens * val) {
+    mtmd_image_tokens_free(val);
 }
 
-int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
-        struct llama_context * lctx,
-        const mtmd_input_chunk * chunk,
-        llama_pos n_past,
-        llama_seq_id seq_id,
-        int32_t n_batch,
-        bool logits_last,
-        llama_pos * new_n_past) {
-    int32_t ret;
-    llama_batch text_batch = llama_batch_init(n_batch, 0, 1);
-    auto chunk_type = mtmd_input_chunk_get_type(chunk);
-
-    if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-        size_t n_tokens;
-        const auto tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
-        LOG_DBG("decoding text chunk, n_tokens = %zu\n", n_tokens);
-        size_t i = 0;
-        while (i < n_tokens) { // split into batches
-            text_batch.n_tokens = 0; // clear the batch
-            for (; i < n_tokens && text_batch.n_tokens < n_batch; i++) {
-                text_batch.n_tokens++;
-                text_batch.token   [i]    = tokens[i];
-                text_batch.pos     [i]    = n_past++;
-                text_batch.n_seq_id[i]    = 1;
-                text_batch.seq_id  [i][0] = seq_id;
-                text_batch.logits  [i]    = false;
-            }
-            bool is_last_token = (i == n_tokens);
-            if (logits_last && is_last_token) {
-                text_batch.logits[text_batch.n_tokens - 1] = true;
-            }
-            ret = llama_decode(lctx, text_batch);
-            if (ret != 0) {
-                LOG_ERR("failed to decode text\n");
-                llama_batch_free(text_batch);
-                return ret;
-            }
-            *new_n_past += text_batch.n_tokens;
-        }
-
-    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-        const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
-        int64_t t0 = ggml_time_ms();
-        if (ctx->print_timings) {
-            LOG_INF("encoding image or slice...\n");
-        }
-        ret = mtmd_encode(ctx, image_tokens);
-        if (ret != 0) {
-            LOG_ERR("failed to encode image\n");
-            llama_batch_free(text_batch);
-            return ret;
-        }
-        if (ctx->print_timings) {
-            LOG_INF("image/slice encoded in %" PRId64 " ms\n", ggml_time_ms() - t0);
-        }
-        float * embd = mtmd_get_output_embd(ctx);
-        ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past);
-        if (ret != 0) {
-            LOG_ERR("failed to decode image\n");
-            llama_batch_free(text_batch);
-            return ret;
-        }
-    } else {
-        GGML_ABORT("chunk type not supported");
-    }
-
-    return 0;
-}
-
-int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
-                                struct llama_context * lctx,
-                                const mtmd_input_chunks * chunks,
-                                llama_pos n_past,
-                                llama_seq_id seq_id,
-                                int32_t n_batch,
-                                bool logits_last,
-                                llama_pos * new_n_past) {
-    size_t n_chunks = mtmd_input_chunks_size(chunks);
-    if (n_chunks == 0) {
-        LOG_WRN("no chunks to eval\n");
-        return 0;
-    }
-
-    for (size_t i = 0; i < n_chunks; i++) {
-        bool chunk_logits_last = (i == n_chunks - 1) && logits_last;
-        auto chunk = mtmd_input_chunks_get(chunks, i);
-
-        int32_t res = mtmd_helper_eval_chunk_single(ctx, lctx, chunk, n_past, seq_id, n_batch, chunk_logits_last, &n_past);
-        if (res != 0) {
-            LOG_ERR("failed to eval chunk %zu\n", i);
-            return res;
-        }
-        *new_n_past = n_past;
-    }
-
-    return 0;
-}
+// these 2 helpers below use internal clip_image_u8_ptr,
+// so unfortunately they cannot moved to mtmd-helper.h
+// however, in theory, user can decode image file to bitmap using
+// whichever library they want, and then use mtmd_bitmap_init() to create bitmap
 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(const unsigned char * buf, size_t len) {
     clip_image_u8_ptr img_u8(clip_image_u8_init());
@@ -786,23 +548,6 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_file(const char * fname) {
     unsigned char * data = clip_image_u8_get_data(img_u8.get(), &nx, &ny);
     return mtmd_bitmap_init(nx, ny, data);
 }
-
-bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
-    projector_type proj_type = clip_get_projector_type(ctx->ctx_clip);
-    if (proj_type == PROJECTOR_TYPE_GEMMA3) {
-        return true;
-    }
-    return false;
-}
-
-bool mtmd_decode_use_mrope(mtmd_context * ctx) {
-    return ctx->use_mrope;
-}
-
-void mtmd_image_tokens_deleter::operator()(mtmd_image_tokens * val) {
-    mtmd_image_tokens_free(val);
-}
-
 
 //
 // public API functions

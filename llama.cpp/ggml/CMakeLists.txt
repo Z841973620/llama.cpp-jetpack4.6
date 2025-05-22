@@ -193,6 +193,7 @@ option(GGML_RPC                             "ggml: use RPC"                     
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
+option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
@@ -221,7 +222,7 @@ set(CMAKE_C_STANDARD_REQUIRED true)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED true)
-set(CMAKE_CXX_FLAGS "-Os -std=c++17")
+set(CMAKE_CXX_FLAGS "-O3 -std=c++17")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 

@@ -8,7 +8,7 @@ set(CMAKE_WARN_UNUSED_CLI YES)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 link_libraries(stdc++fs)
-set(CMAKE_CXX_FLAGS "-Os -std=c++17 -lstdc++fs")
+set(CMAKE_CXX_FLAGS "-O3 -std=c++17 -lstdc++fs")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

@@ -2,7 +2,7 @@
 
 ![IMG](./IMG.png)
 
-基于 llama.cpp b5342，删除了 bf16 支持以在 cuda10.2 环境编译
+基于 llama.cpp b5443，删除了 bf16 支持以在 cuda10.2 环境编译
 
 需从源码构建 gcc-8.5，默认自带的 gcc-7 缺少功能 ```vld1q_s8_x4```
 
@@ -19,8 +19,9 @@ make && make install
 ```
 # compile llama.cpp for sm_53, sm_62 and sm_72
 git clone https://github.com/Z841973620/llama.cpp-tegra.git && cd llama.cpp-tegra/llama.cpp
-cmake -B build -DBUILD_SHARED_LIBS=OFF -DGGML_CPU_ARM_ARCH=native -DGGML_NATIVE=OFF \
-    -DLLAMA_CURL=ON -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_FLAGS="-Os -std=c++17 -lstdc++fs" \
-    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="53;62;72" -DGGML_CUDA_FA_ALL_QUANTS=ON
-cmake --build build --config Release -j --target llama-server llama-cli
+cmake -B build \
+	-DLLAMA_CURL=ON -DBUILD_SHARED_LIBS=OFF \
+	-DGGML_CPU_ARM_ARCH=native -DGGML_NATIVE=OFF \
+	-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES="53;62;72"
+cmake --build build --config Release -j --target llama-server llama-cli llama-bench llama-quantize
 ```

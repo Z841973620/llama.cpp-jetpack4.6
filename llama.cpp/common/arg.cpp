@@ -1446,6 +1446,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--swa-full"},
+        string_format("use full-size SWA cache (default: %s)\n"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)", params.swa_full ? "true" : "false"),
+        [](common_params & params) {
+            params.swa_full = true;
+        }
+    ).set_env("LLAMA_ARG_SWA_FULL"));
+    add_opt(common_arg(
         {"--no-context-shift"},
         string_format("disables context shift on infinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),
         [](common_params & params) {
@@ -2058,13 +2066,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_GRP_ATTN_W").set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
-        {"-dkvc", "--dump-kv-cache"},
-        "verbose print of the KV cache",
-        [](common_params & params) {
-            params.dump_kv_cache = true;
-        }
-    ));
-    add_opt(common_arg(
         {"-nkvo", "--no-kv-offload"},
         "disable KV offload",
         [](common_params & params) {
@@ -2438,6 +2439,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--no-op-offload"},
+        string_format("disable offloading host tensor operations to device (default: %s)", params.no_op_offload ? "true" : "false"),
+        [](common_params & params) {
+            params.no_op_offload = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (can be repeated to use multiple adapters)",
         [](common_params & params, const std::string & value) {
@@ -2578,7 +2586,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.n_junk = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_PASSKEY}));
+    ).set_examples({LLAMA_EXAMPLE_PASSKEY, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
         {"--pos"}, "N",
         string_format("position of the passkey in the junk text (default: %d)", params.i_pos),
@@ -2641,7 +2649,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.is_pp_shared = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    ).set_examples({LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
         {"-npp"}, "n0,n1,...",
         "number of prompt tokens",
@@ -2873,6 +2881,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.chat_template = read_file(value);
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
+    add_opt(common_arg(
+        {"--no-prefill-assistant"},
+        string_format(
+            "whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)\n"
+            "when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled\n"
+        ),
+        [](common_params & params) {
+            params.prefill_assistant = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NO_PREFILL_ASSISTANT"));
     add_opt(common_arg(
         {"-sps", "--slot-prompt-similarity"}, "SIMILARITY",
         string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
