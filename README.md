@@ -2,7 +2,7 @@
 
 ![IMG](./IMG.png)
 
-基于 llama.cpp b5443，删除了 bf16 支持以在 cuda10.2 环境编译
+基于 llama.cpp b5556，删除了 bf16 支持以在 cuda10.2 环境编译
 
 需从源码构建 gcc-8.5，默认自带的 gcc-7 缺少功能 ```vld1q_s8_x4```
 
