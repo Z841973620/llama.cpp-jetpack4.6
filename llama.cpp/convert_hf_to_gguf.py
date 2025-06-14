@@ -556,8 +556,11 @@ class TextModel(ModelBase):
             logger.info(f"gguf: experts used count = {n_experts_used}")
 
         if (head_dim := self.hparams.get("head_dim")) is not None:
-            self.gguf_writer.add_key_length(head_dim)
-            self.gguf_writer.add_value_length(head_dim)
+            # Workaround for incorrect AutoConfig value for DeepSeekV3 (is set correctly in DeepSeekV2Model class)
+            # https://github.com/huggingface/transformers/blob/19224c3642705c5b6988c9f5f4251f83323d05ae/src/transformers/models/deepseek_v3/configuration_deepseek_v3.py#L210
+            if self.hparams.get("model_type") != "deepseek_v3":
+                self.gguf_writer.add_key_length(head_dim)
+                self.gguf_writer.add_value_length(head_dim)
 
         self.gguf_writer.add_file_type(self.ftype)
         logger.info(f"gguf: file type = {self.ftype}")
@@ -3709,8 +3712,7 @@ class BertModel(TextModel):
         self._try_set_pooling_type()
 
         if self.cls_out_labels:
-            key_name = gguf.Keys.Classifier.OUTPUT_LABELS.format(arch = gguf.MODEL_ARCH_NAMES[self.model_arch])
-            self.gguf_writer.add_array(key_name, [v for k, v in sorted(self.cls_out_labels.items())])
+            self.gguf_writer.add_classifier_output_labels([v for k, v in sorted(self.cls_out_labels.items())])
 
     def set_vocab(self):
         tokens, toktypes, tokpre = self.get_vocab_base()
@@ -3814,7 +3816,7 @@ class BertModel(TextModel):
             remove_whitespaces = tokenizer.clean_up_tokenization_spaces
             precompiled_charsmap = b64decode(tokenizer_json["normalizer"]["precompiled_charsmap"])
 
-            vocab_size = self.hparams.get("vocab_size", tokenizer.vocab_size)
+            vocab_size = max(self.hparams.get("vocab_size", 0), tokenizer.vocab_size)
         else:
             sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue]
             sentencepiece_model.ParseFromString(open(tokenizer_path, "rb").read())
@@ -3827,7 +3829,7 @@ class BertModel(TextModel):
             tokenizer = SentencePieceProcessor()
             tokenizer.LoadFromFile(str(tokenizer_path))
 
-            vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
+            vocab_size = max(self.hparams.get("vocab_size", 0), tokenizer.vocab_size())
 
         tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
         scores: list[float] = [-10000.0] * vocab_size
@@ -3857,33 +3859,26 @@ class BertModel(TextModel):
             unk_token = tokenizer_config_json.get("unk_token")
             unk_token_id = added_vocab.get(unk_token, tokenizer_json["model"].get("unk_id", 3))
 
-            for token_id in range(vocab_size):
+            for token_id in range(tokenizer.vocab_size):
                 piece = tokenizer._convert_id_to_token(token_id)
-                text = piece.encode("utf-8")
-                score = tokenizer_json["model"]["vocab"][token_id][1]
+                if (piece := tokenizer._convert_id_to_token(token_id)) is not None:
+                    text = piece.encode("utf-8")
+                    score = tokenizer_json["model"]["vocab"][token_id][1]
 
-                toktype = SentencePieceTokenTypes.NORMAL
-                if token_id == unk_token_id:
-                    toktype = SentencePieceTokenTypes.UNKNOWN
-                elif token_id in tokenizer.all_special_ids:
-                    toktype = SentencePieceTokenTypes.CONTROL
-                elif token_id in added_vocab.values():
-                    toktype = SentencePieceTokenTypes.USER_DEFINED
-                # No reliable way to detect this, but jina doesn't have any
-                # elif tokenizer.IsByte(token_id):
-                #     toktype = SentencePieceTokenTypes.BYTE
+                    toktype = SentencePieceTokenTypes.NORMAL
+                    if token_id == unk_token_id:
+                        toktype = SentencePieceTokenTypes.UNKNOWN
+                    elif token_id in tokenizer.all_special_ids:
+                        toktype = SentencePieceTokenTypes.CONTROL
+                    elif token_id in added_vocab.values():
+                        toktype = SentencePieceTokenTypes.USER_DEFINED
+                    # No reliable way to detect this, but jina doesn't have any
+                    # elif tokenizer.IsByte(token_id):
+                    #     toktype = SentencePieceTokenTypes.BYTE
 
-                tokens[token_id] = text
-                scores[token_id] = score
-                toktypes[token_id] = toktype
-
-        if vocab_size > len(tokens):
-            pad_count = vocab_size - len(tokens)
-            logger.debug(f"Padding vocab with {pad_count} token(s) - [PAD1] through [PAD{pad_count}]")
-            for i in range(1, pad_count + 1):
-                tokens.append(bytes(f"[PAD{i}]", encoding="utf-8"))
-                scores.append(-1000.0)
-                toktypes.append(SentencePieceTokenTypes.UNUSED)
+                    tokens[token_id] = text
+                    scores[token_id] = score
+                    toktypes[token_id] = toktype
 
         if isinstance(tokenizer, SentencePieceProcessor):
             # realign tokens (see HF tokenizer code)
@@ -3895,6 +3890,12 @@ class BertModel(TextModel):
                 SentencePieceTokenTypes.CONTROL,
                 SentencePieceTokenTypes.UNKNOWN,
             ] + toktypes[3:-1]
+
+            if self.model_arch == gguf.MODEL_ARCH.NOMIC_BERT_MOE:
+                # Add mask token missing from sentencepiece.bpe.model
+                tokens[250001] = b'<mask>'
+                scores[250001] = 0.0
+                toktypes[250001] = SentencePieceTokenTypes.CONTROL
 
         self.gguf_writer.add_tokenizer_model("t5")
         self.gguf_writer.add_tokenizer_pre("default")
@@ -4800,25 +4801,6 @@ class OlmoeModel(TextModel):
 class JinaBertV2Model(BertModel):
     model_arch = gguf.MODEL_ARCH.JINA_BERT_V2
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.intermediate_size = self.hparams["intermediate_size"]
-
-    def get_tensors(self):
-        for name, data in super().get_tensors():
-            if 'gated_layer' in name:
-                d1 = data[:self.intermediate_size, :]
-                name1 = name.replace('gated_layers', 'gated_layers_w')
-                name1 = name1.replace('up_gated_layer', 'gated_layers_v')
-                d2 = data[self.intermediate_size:, :]
-                name2 = name.replace('gated_layers', 'gated_layers_v')
-                name2 = name2.replace('up_gated_layer', 'gated_layers_w')
-                yield name1, d1
-                yield name2, d2
-                continue
-
-            yield name, data
-
     def set_vocab(self):
         tokenizer_class = 'BertTokenizer'
         with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
@@ -4833,14 +4815,6 @@ class JinaBertV2Model(BertModel):
             raise NotImplementedError(f'Tokenizer {tokenizer_class} is not supported for JinaBertModel')
         self.gguf_writer.add_add_bos_token(True)
         self.gguf_writer.add_add_eos_token(True)
-
-    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # if name starts with "bert.", remove the prefix
-        # e.g. https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
-        if name.startswith("bert."):
-            name = name[5:]
-
-        return super().modify_tensors(data_torch, name, bid)
 
 
 @ModelBase.register("OpenELMForCausalLM")
