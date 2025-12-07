@@ -81,6 +81,14 @@ int main(int argc, char ** argv) {
 
     params.embedding = true;
 
+    // if the number of prompts that would be encoded is known in advance, it's more efficient to specify the
+    //   --parallel argument accordingly. for convenience, if not specified, we fallback to unified KV cache
+    //   in order to support any number of prompts
+    if (params.n_parallel == 1) {
+        LOG_INF("%s: n_parallel == 1 -> unified KV cache is enabled\n", __func__);
+        params.kv_unified = true;
+    }
+
     // utilize the full context
     if (params.n_batch < params.n_ctx) {
         LOG_WRN("%s: setting batch size to %d\n", __func__, params.n_ctx);
@@ -107,7 +115,7 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
-    const int n_ctx = llama_n_ctx(ctx);
+    const int n_ctx       = llama_n_ctx(ctx);
 
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
 
@@ -133,10 +141,36 @@ int main(int argc, char ** argv) {
     // max batch size
     const uint64_t n_batch = params.n_batch;
 
+    // get added sep and eos token, if any
+    const std::string added_sep_token = llama_vocab_get_add_sep(vocab) ? llama_vocab_get_text(vocab, llama_vocab_sep(vocab)) : "";
+    const std::string added_eos_token = llama_vocab_get_add_eos(vocab) ? llama_vocab_get_text(vocab, llama_vocab_eos(vocab)) : "";
+
     // tokenize the prompts and trim
     std::vector<std::vector<int32_t>> inputs;
     for (const auto & prompt : prompts) {
-        auto inp = common_tokenize(ctx, prompt, true, true);
+        std::vector<llama_token> inp;
+
+        // split classification pairs and insert expected separator tokens
+        if (pooling_type == LLAMA_POOLING_TYPE_RANK && prompt.find(params.cls_sep) != std::string::npos) {
+            std::vector<std::string> pairs = split_lines(prompt, params.cls_sep);
+            std::string final_prompt;
+
+            for (size_t i = 0; i < pairs.size(); i++) {
+                final_prompt += pairs[i];
+                if (i != pairs.size() - 1) {
+                    if (!added_eos_token.empty()) {
+                        final_prompt += added_eos_token;
+                    }
+                    if (!added_sep_token.empty()) {
+                        final_prompt += added_sep_token;
+                    }
+                }
+            }
+
+            inp = common_tokenize(ctx, final_prompt, true, true);
+        } else {
+            inp = common_tokenize(ctx, prompt, true, true);
+        }
         if (inp.size() > n_batch) {
             LOG_ERR("%s: number of tokens in input line (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
                     __func__, (long long int) inp.size(), (long long int) n_batch);
@@ -145,11 +179,11 @@ int main(int argc, char ** argv) {
         inputs.push_back(inp);
     }
 
-    // check if the last token is SEP
+    // check if the last token is SEP/EOS
     // it should be automatically added by the tokenizer when 'tokenizer.ggml.add_eos_token' is set to 'true'
     for (auto & inp : inputs) {
-        if (inp.empty() || inp.back() != llama_vocab_sep(vocab)) {
-            LOG_WRN("%s: last token in the prompt is not SEP\n", __func__);
+        if (inp.empty() || (inp.back() != llama_vocab_sep(vocab) && inp.back() != llama_vocab_eos(vocab))) {
+            LOG_WRN("%s: last token in the prompt is not SEP or EOS\n", __func__);
             LOG_WRN("%s: 'tokenizer.ggml.add_eos_token' should be set to 'true' in the GGUF header\n", __func__);
         }
     }
