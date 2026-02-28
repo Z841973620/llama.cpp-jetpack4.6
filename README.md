@@ -26,9 +26,9 @@ cmake -B build -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF \
 cmake --build build --config Release -j $(nproc) \
 	--target llama-server llama-cli llama-mtmd-cli llama-bench llama-quantize llama-gguf-split
 ```
-
+<br><br>
 ----------
-
+<br><br>
 由于 [jetpack 4.6 对应的 l4t r32.7 支持 vulkan 1.2](https://developer.nvidia.com/embedded/vulkan)，所以也可以使用 Vulkan 后端
 
 从源码编译 glslc：
