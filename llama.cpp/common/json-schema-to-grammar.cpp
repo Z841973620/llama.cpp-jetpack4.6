@@ -1,9 +1,8 @@
 #include "json-schema-to-grammar.h"
 #include "common.h"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -12,7 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
-using json = nlohmann::ordered_json;
+using json = common_json;
 
 static std::string build_repetition(const std::string & item_rule, int min_items, int max_items, const std::string & separator_rule = "") {
     auto has_max = max_items != std::numeric_limits<int>::max();
@@ -27,11 +26,11 @@ static std::string build_repetition(const std::string & item_rule, int min_items
     if (separator_rule.empty()) {
         if (min_items == 1 && !has_max) {
             return item_rule + "+";
-        } else if (min_items == 0 && !has_max) {
-            return item_rule + "*";
-        } else {
-            return item_rule + "{" + std::to_string(min_items) + "," + (has_max ? std::to_string(max_items) : "") + "}";
         }
+        if (min_items == 0 && !has_max) {
+            return item_rule + "*";
+        }
+        return item_rule + "{" + std::to_string(min_items) + "," + (has_max ? std::to_string(max_items) : "") + "}";
     }
 
     auto result = item_rule + " " + build_repetition("(" + separator_rule + " " + item_rule + ")", min_items == 0 ? 0 : min_items - 1, has_max ? max_items - 1 : max_items);
@@ -41,7 +40,7 @@ static std::string build_repetition(const std::string & item_rule, int min_items
     return result;
 }
 
-static void _build_min_max_int(int64_t min_value, int64_t max_value, std::stringstream & out, int decimals_left = 16, bool top_level = true) {
+static void build_min_max_int(int64_t min_value, int64_t max_value, std::stringstream & out, int decimals_left = 16, bool top_level = true) {
     auto has_min = min_value != std::numeric_limits<int64_t>::min();
     auto has_max = max_value != std::numeric_limits<int64_t>::max();
 
@@ -128,14 +127,14 @@ static void _build_min_max_int(int64_t min_value, int64_t max_value, std::string
     if (has_min && has_max) {
         if (min_value < 0 && max_value < 0) {
             out << "\"-\" (";
-            _build_min_max_int(-max_value, -min_value, out, decimals_left, /* top_level= */ true);
+            build_min_max_int(-max_value, -min_value, out, decimals_left, /* top_level= */ true);
             out << ")";
             return;
         }
 
         if (min_value < 0) {
             out << "\"-\" (";
-            _build_min_max_int(0, -min_value, out, decimals_left, /* top_level= */ true);
+            build_min_max_int(0, -min_value, out, decimals_left, /* top_level= */ true);
             out << ") | ";
             min_value = 0;
         }
@@ -159,7 +158,7 @@ static void _build_min_max_int(int64_t min_value, int64_t max_value, std::string
     if (has_min) {
         if (min_value < 0) {
             out << "\"-\" (";
-            _build_min_max_int(std::numeric_limits<int64_t>::min(), -min_value, out, decimals_left, /* top_level= */ false);
+            build_min_max_int(std::numeric_limits<int64_t>::min(), -min_value, out, decimals_left, /* top_level= */ false);
             out << ") | [0] | [1-9] ";
             more_digits(0, decimals_left - 1);
         } else if (min_value == 0) {
@@ -194,7 +193,7 @@ static void _build_min_max_int(int64_t min_value, int64_t max_value, std::string
             }
             digit_range(c, c);
             out << " (";
-            _build_min_max_int(std::stoll(min_s.substr(1)), std::numeric_limits<int64_t>::max(), out, less_decimals, /* top_level= */ false);
+            build_min_max_int(std::stoll(min_s.substr(1)), std::numeric_limits<int64_t>::max(), out, less_decimals, /* top_level= */ false);
             out << ")";
             if (c < '9') {
                 out << " | ";
@@ -213,10 +212,10 @@ static void _build_min_max_int(int64_t min_value, int64_t max_value, std::string
                 more_digits(0, less_decimals);
                 out << " | ";
             }
-            _build_min_max_int(0, max_value, out, decimals_left, /* top_level= */ true);
+            build_min_max_int(0, max_value, out, decimals_left, /* top_level= */ true);
         } else {
             out << "\"-\" (";
-            _build_min_max_int(-max_value, std::numeric_limits<int64_t>::max(), out, decimals_left, /* top_level= */ false);
+            build_min_max_int(-max_value, std::numeric_limits<int64_t>::max(), out, decimals_left, /* top_level= */ false);
             out << ")";
         }
         return;
@@ -232,50 +231,56 @@ struct BuiltinRule {
     std::vector<std::string> deps;
 };
 
-std::unordered_map<std::string, BuiltinRule> PRIMITIVE_RULES = {
-    {"boolean", {"(\"true\" | \"false\") space", {}}},
+static std::unordered_map<std::string, BuiltinRule> PRIMITIVE_RULES = {
+    {"boolean", {"(\"true\" | \"false\")", {}}},
     {"decimal-part", {"[0-9]{1,16}", {}}},
     {"integral-part", {"[0] | [1-9] [0-9]{0,15}", {}}},
-    {"number", {"(\"-\"? integral-part) (\".\" decimal-part)? ([eE] [-+]? integral-part)? space", {"integral-part", "decimal-part"}}},
-    {"integer", {"(\"-\"? integral-part) space", {"integral-part"}}},
+    {"number", {"(\"-\"? integral-part) (\".\" decimal-part)? ([eE] [-+]? integral-part)?", {"integral-part", "decimal-part"}}},
+    {"integer", {"(\"-\"? integral-part)", {"integral-part"}}},
     {"value", {"object | array | string | number | boolean | null", {"object", "array", "string", "number", "boolean", "null"}}},
-    {"object", {"\"{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? \"}\" space", {"string", "value"}}},
-    {"array", {"\"[\" space ( value (\",\" space value)* )? \"]\" space", {"value"}}},
-    {"uuid", {"\"\\\"\" [0-9a-fA-F]{8} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{12} \"\\\"\" space", {}}},
+    {"object", {"\"{\" space ( string \":\" space value (\",\" space string \":\" space value)* )? space \"}\"", {"string", "value"}}},
+    {"array", {"\"[\" space ( value (\",\" space value)* )? space \"]\"", {"value"}}},
+    {"uuid", {"\"\\\"\" [0-9a-fA-F]{8} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{4} \"-\" [0-9a-fA-F]{12} \"\\\"\"", {}}},
     {"char",   {"[^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{4})", {}}},
-    {"string", {"\"\\\"\" char* \"\\\"\" space", {"char"}}},
-    {"null", {"\"null\" space", {}}},
+    {"string", {"\"\\\"\" char* \"\\\"\"", {"char"}}},
+    {"null", {"\"null\"", {}}},
 };
 
-std::unordered_map<std::string, BuiltinRule> STRING_FORMAT_RULES = {
+static std::unordered_map<std::string, BuiltinRule> STRING_FORMAT_RULES = {
     {"date", {"[0-9]{4} \"-\" ( \"0\" [1-9] | \"1\" [0-2] ) \"-\" ( \"0\" [1-9] | [1-2] [0-9] | \"3\" [0-1] )", {}}},
     {"time", {"([01] [0-9] | \"2\" [0-3]) \":\" [0-5] [0-9] \":\" [0-5] [0-9] ( \".\" [0-9]{3} )? ( \"Z\" | ( \"+\" | \"-\" ) ( [01] [0-9] | \"2\" [0-3] ) \":\" [0-5] [0-9] )", {}}},
     {"date-time", {"date \"T\" time", {"date", "time"}}},
-    {"date-string", {"\"\\\"\" date \"\\\"\" space", {"date"}}},
-    {"time-string", {"\"\\\"\" time \"\\\"\" space", {"time"}}},
-    {"date-time-string", {"\"\\\"\" date-time \"\\\"\" space", {"date-time"}}}
+    {"date-string", {"\"\\\"\" date \"\\\"\"", {"date"}}},
+    {"time-string", {"\"\\\"\" time \"\\\"\"", {"time"}}},
+    {"date-time-string", {"\"\\\"\" date-time \"\\\"\"", {"date-time"}}}
 };
 
 static bool is_reserved_name(const std::string & name) {
     static const std::unordered_set<std::string> RESERVED_NAMES = [] {
         std::unordered_set<std::string> s;
         s.insert("root");
-        for (const auto & p : PRIMITIVE_RULES) s.insert(p.first);
-        for (const auto & p : STRING_FORMAT_RULES) s.insert(p.first);
+        for (const auto & p : PRIMITIVE_RULES) {
+            s.insert(p.first);
+        }
+        for (const auto & p : STRING_FORMAT_RULES) {
+            s.insert(p.first);
+        }
         return s;
     }();
     return RESERVED_NAMES.find(name) != RESERVED_NAMES.end();
 }
 
-std::regex INVALID_RULE_CHARS_RE("[^a-zA-Z0-9-]+");
-std::regex GRAMMAR_LITERAL_ESCAPE_RE("[\r\n\"\\\\]");
-std::regex GRAMMAR_RANGE_LITERAL_ESCAPE_RE("[\r\n\"\\]\\-\\\\]");
-std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
+static std::regex INVALID_RULE_CHARS_RE("[^a-zA-Z0-9-]+");
+static std::regex GRAMMAR_LITERAL_ESCAPE_RE("[\r\n\"\\\\]");
+static std::regex GRAMMAR_RANGE_LITERAL_ESCAPE_RE("[\r\n\"\\]\\-\\\\]");
+static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
     {'\r', "\\r"}, {'\n', "\\n"}, {'"', "\\\""}, {'-', "\\-"}, {']', "\\]"}, {'\\', "\\\\"}
 };
 
-std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?'};
-std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
+static const int MAX_PATTERN_DEPTH = 100;
+
+static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?', '^', '$'};
+static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
 
 static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
     std::smatch match;
@@ -305,6 +310,32 @@ static std::string format_literal(const std::string & literal) {
 
 std::string gbnf_format_literal(const std::string & literal) { return format_literal(literal); }
 
+static size_t gbnf_escape_length(const std::string & pattern, size_t pos) {
+    if (pos + 1 >= pattern.length() || pattern[pos] != '\\') {
+        return 0;
+    }
+    size_t n_hex = 0;
+    switch (pattern[pos + 1]) {
+        case 'x': n_hex = 2; break;
+        case 'u': n_hex = 4; break;
+        case 'U': n_hex = 8; break;
+        case 't': case 'r': case 'n': case '\\': case '"': case '[': case ']':
+            return 2;
+        default:
+            return 0;
+    }
+    if (pos + 2 + n_hex > pattern.length()) {
+        return 0;
+    }
+    for (size_t i = pos + 2; i < pos + 2 + n_hex; i++) {
+        char h = pattern[i];
+        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) {
+            return 0;
+        }
+    }
+    return 2 + n_hex;
+}
+
 class common_schema_converter {
 private:
     friend class common_schema_info;
@@ -322,35 +353,61 @@ private:
         if (_rules.find(esc_name) == _rules.end() || _rules[esc_name] == rule) {
             _rules[esc_name] = rule;
             return esc_name;
-        } else {
-            int i = 0;
-            while (_rules.find(esc_name + std::to_string(i)) != _rules.end() && _rules[esc_name + std::to_string(i)] != rule) {
-                i++;
-            }
-            std::string key = esc_name + std::to_string(i);
-            _rules[key] = rule;
-            return key;
         }
+        int i = 0;
+        while (_rules.find(esc_name + std::to_string(i)) != _rules.end() && _rules[esc_name + std::to_string(i)] != rule) {
+            i++;
+        }
+        std::string key = esc_name + std::to_string(i);
+        _rules[key] = rule;
+        return key;
     }
 
     std::string _generate_union_rule(const std::string & name, const std::vector<json> & alt_schemas) {
         std::vector<std::string> rules;
+        rules.reserve(alt_schemas.size());
         for (size_t i = 0; i < alt_schemas.size(); i++) {
             rules.push_back(visit(alt_schemas[i], name + (name.empty() ? "alternative-" : "-") + std::to_string(i)));
         }
         return string_join(rules, " | ");
     }
 
+    // thrown when the pattern is a valid regex with no grammar equivalent
+    struct unsupported_pattern : public std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+
+    // thrown when the pattern is not a valid regex
+    struct invalid_pattern : public std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+
     std::string _visit_pattern(const std::string & pattern, const std::string & name) {
-        if (!(pattern.front() == '^' && pattern.back() == '$')) {
-            _errors.push_back("Pattern must start with '^' and end with '$'");
+        auto rules_snapshot = _rules;
+        try {
+            return _pattern_to_rule(pattern, name);
+        } catch (const unsupported_pattern & err) {
+            // revert rules
+            _rules = std::move(rules_snapshot);
+            _warnings.push_back("pattern " + pattern + " is not supported (" + err.what() + "), accepting any string");
+            return _add_rule(name, _add_primitive("string", PRIMITIVE_RULES.at("string")));
+        } catch (const invalid_pattern & err) {
+            _rules = std::move(rules_snapshot);
+            _errors.push_back("Invalid pattern " + pattern + ": " + err.what());
             return "";
+        }
+    }
+
+    std::string _pattern_to_rule(const std::string & pattern, const std::string & name) {
+        if (pattern.length() < 2 || pattern.front() != '^' || pattern.back() != '$') {
+            throw unsupported_pattern("not anchored with '^' and '$'");
         }
         std::string sub_pattern = pattern.substr(1, pattern.length() - 2);
         std::unordered_map<std::string, std::string> sub_rule_ids;
 
         size_t i = 0;
         size_t length = sub_pattern.length();
+        int paren_depth = 0;
 
         using literal_or_rule = std::pair<std::string, bool>;
         auto to_rule = [&](const literal_or_rule & ls) {
@@ -359,7 +416,6 @@ private:
             return is_literal ? "\"" + s + "\"" : s;
         };
         std::function<literal_or_rule()> transform = [&]() -> literal_or_rule {
-            size_t start = i;
             std::vector<literal_or_rule> seq;
 
             auto get_dot = [&]() {
@@ -398,6 +454,7 @@ private:
                 flush_literal();
 
                 std::vector<std::string> results;
+                results.reserve(ret.size());
                 for (const auto & item : ret) {
                     results.push_back(to_rule(item));
                 }
@@ -411,32 +468,46 @@ private:
                     i++;
                 } else if (c == '(') {
                     i++;
-                    if (i < length) {
-                        if (sub_pattern[i] == '?') {
-                            _warnings.push_back("Unsupported pattern syntax");
+                    if (i < length && sub_pattern[i] == '?') {
+                        if (i + 1 < length && sub_pattern[i + 1] == ':') {
+                            i += 2; // skip "?:" for non-capturing group, treat as regular group
+                        } else {
+                            // lookaround, named group, inline flags, ...
+                            throw unsupported_pattern("unsupported group syntax");
                         }
+                    }
+                    paren_depth++;
+                    if (paren_depth > MAX_PATTERN_DEPTH) {
+                        throw unsupported_pattern("pattern nesting too deep");
                     }
                     seq.emplace_back("(" + to_rule(transform()) + ")", false);
                 } else if (c == ')') {
                     i++;
-                    if (start > 0 && sub_pattern[start - 1] != '(') {
-                        _errors.push_back("Unbalanced parentheses");
+                    if (paren_depth == 0) {
+                        throw invalid_pattern("unbalanced parentheses");
                     }
+                    paren_depth--;
                     return join_seq();
+                } else if (c == '^' || c == '$') {
+                    throw unsupported_pattern("anchor inside the pattern");
                 } else if (c == '[') {
                     std::string square_brackets = std::string(1, c);
                     i++;
                     while (i < length && sub_pattern[i] != ']') {
                         if (sub_pattern[i] == '\\') {
-                            square_brackets += sub_pattern.substr(i, 2);
-                            i += 2;
+                            auto escape_length = gbnf_escape_length(sub_pattern, i);
+                            if (escape_length == 0) {
+                                throw unsupported_pattern("unsupported escape in character class: " + sub_pattern.substr(i, 2));
+                            }
+                            square_brackets += sub_pattern.substr(i, escape_length);
+                            i += escape_length;
                         } else {
                             square_brackets += sub_pattern[i];
                             i++;
                         }
                     }
                     if (i >= length) {
-                        _errors.push_back("Unbalanced square brackets");
+                        throw invalid_pattern("unterminated character class");
                     }
                     square_brackets += ']';
                     i++;
@@ -445,6 +516,9 @@ private:
                     seq.emplace_back("|", false);
                     i++;
                 } else if (c == '*' || c == '+' || c == '?') {
+                    if (seq.empty()) {
+                        throw invalid_pattern("nothing to repeat");
+                    }
                     seq.back() = std::make_pair(to_rule(seq.back()) + c, false);
                     i++;
                 } else if (c == '{') {
@@ -455,18 +529,19 @@ private:
                         i++;
                     }
                     if (i >= length) {
-                        _errors.push_back("Unbalanced curly brackets");
+                        throw unsupported_pattern("unterminated curly brackets");
                     }
                     curly_brackets += '}';
                     i++;
                     auto nums = string_split(curly_brackets.substr(1, curly_brackets.length() - 2), ",");
                     int min_times = 0;
                     int max_times = std::numeric_limits<int>::max();
+                    if (nums.size() != 1 && nums.size() != 2) {
+                        throw unsupported_pattern("wrong number of values in curly brackets");
+                    }
                     try {
                         if (nums.size() == 1) {
                             min_times = max_times = std::stoi(nums[0]);
-                        } else if (nums.size() != 2) {
-                            _errors.push_back("Wrong number of values in curly brackets");
                         } else {
                             if (!nums[0].empty()) {
                                 min_times = std::stoi(nums[0]);
@@ -475,9 +550,11 @@ private:
                                 max_times = std::stoi(nums[1]);
                             }
                         }
-                    } catch (const std::invalid_argument & e) {
-                        _errors.push_back("Invalid number in curly brackets");
-                        return std::make_pair("", false);
+                    } catch (const std::logic_error &) {
+                        throw unsupported_pattern("invalid number in curly brackets");
+                    }
+                    if (seq.empty()) {
+                        throw invalid_pattern("nothing to repeat");
                     }
                     auto &last = seq.back();
                     auto &sub = last.first;
@@ -503,15 +580,22 @@ private:
                         return NON_LITERAL_SET.find(c) != NON_LITERAL_SET.end();
                     };
                     while (i < length) {
-                        if (sub_pattern[i] == '\\' && i < length - 1) {
+                        if (sub_pattern[i] == '\\') {
+                            if (i == length - 1) {
+                                throw invalid_pattern("trailing backslash");
+                            }
                             char next = sub_pattern[i + 1];
                             if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
                                 i++;
                                 literal += sub_pattern[i];
                                 i++;
                             } else {
-                                literal += sub_pattern.substr(i, 2);
-                                i += 2;
+                                auto escape_length = gbnf_escape_length(sub_pattern, i);
+                                if (escape_length == 0) {
+                                    throw unsupported_pattern("unsupported escape: " + sub_pattern.substr(i, 2));
+                                }
+                                literal += sub_pattern.substr(i, escape_length);
+                                i += escape_length;
                             }
                         } else if (sub_pattern[i] == '"') {
                             literal += "\\\"";
@@ -524,23 +608,30 @@ private:
                             break;
                         }
                     }
-                    if (!literal.empty()) {
-                        seq.emplace_back(literal, true);
+                    if (literal.empty()) { // nothing was consumed, ex. a stray ']' or '}'
+                        throw unsupported_pattern(std::string("unsupported character: ") + c);
                     }
+                    seq.emplace_back(literal, true);
                 }
             }
             return join_seq();
         };
-        return _add_rule(name, "\"\\\"\" (" + to_rule(transform()) + ") \"\\\"\" space");
+
+        auto rule = to_rule(transform());
+        if (paren_depth != 0) {
+            throw invalid_pattern("unbalanced parentheses");
+        }
+
+        return _add_rule(name, "\"\\\"\" (" + rule + ") \"\\\"\"");
     }
 
     /*
         Returns a rule that matches a JSON string that is none of the provided strings
 
         not_strings({"a"})
-            -> ["] ( [a] char+ | [^"a] char* )? ["] space
+            -> ["] ( [a] char+ | [^"a] char* )? ["]
         not_strings({"and", "also"})
-            -> ["] ( [a] ([l] ([s] ([o] char+ | [^"o] char*) | [^"s] char*) | [n] ([d] char+ | [^"d] char*) | [^"ln] char*) | [^"a] char* )? ["] space
+            -> ["] ( [a] ([l] ([s] ([o] char+ | [^"o] char*) | [^"s] char*) | [n] ([d] char+ | [^"d] char*) | [^"ln] char*) | [^"a] char* )? ["]
     */
     std::string _not_strings(const std::vector<std::string> & strings) {
 
@@ -551,7 +642,7 @@ private:
             TrieNode() : is_end_of_string(false) {}
 
             void insert(const std::string & string) {
-                auto node = this;
+                auto *node = this;
                 for (char c : string) {
                     node = &node->children[c];
                 }
@@ -599,7 +690,7 @@ private:
         if (!trie.is_end_of_string) {
             out << "?";
         }
-        out << " [\"] space";
+        out << " [\"]";
         return out.str();
     }
 
@@ -676,7 +767,7 @@ private:
                 if (ks.empty()) {
                     return res;
                 }
-                std::string k = ks[0];
+                const std::string& k = ks[0];
                 std::string kv_rule_name = prop_kv_rule_names[k];
                 std::string comma_ref = "( \",\" space " + kv_rule_name + " )";
                 if (first_is_optional) {
@@ -705,7 +796,7 @@ private:
             rule += " )?";
         }
 
-        rule += " \"}\" space";
+        rule += " space \"}\"";
 
         return rule;
     }
@@ -779,13 +870,13 @@ public:
                         std::string pointer = ref.substr(ref.find('#') + 1);
                         std::vector<std::string> tokens = string_split(pointer, "/");
                         for (size_t i = 1; i < tokens.size(); ++i) {
-                            std::string sel = tokens[i];
+                            const std::string& sel = tokens[i];
                             if (target.is_object() && target.contains(sel)) {
                                 target = target[sel];
                             } else if (target.is_array()) {
                                 size_t sel_index;
                                 try {
-                                    sel_index = std::stoul(sel);
+                                    sel_index = std::stoull(sel);
                                 } catch (const std::invalid_argument & e) {
                                     sel_index = target.size();
                                 }
@@ -802,7 +893,7 @@ public:
                         _refs[ref] = target;
                     }
                 } else {
-                    for (auto & kv : n.items()) {
+                    for (const auto & kv : n.items()) {
                         visit_refs(kv.value());
                     }
                 }
@@ -812,7 +903,7 @@ public:
         visit_refs(schema);
     }
 
-    std::string _generate_constant_rule(const json & value) {
+    static std::string _generate_constant_rule(const json & value) {
         return format_literal(value.dump());
     }
 
@@ -823,10 +914,16 @@ public:
 
         if (schema.contains("$ref")) {
             return _add_rule(rule_name, _resolve_ref(schema["$ref"]));
-        } else if (schema.contains("oneOf") || schema.contains("anyOf")) {
-            std::vector<json> alt_schemas = schema.contains("oneOf") ? schema["oneOf"].get<std::vector<json>>() : schema["anyOf"].get<std::vector<json>>();
+        }
+        if (schema.contains("oneOf") || schema.contains("anyOf")) {
+            const json & alts = schema.contains("oneOf") ? schema.at("oneOf") : schema.at("anyOf");
+            std::vector<json> alt_schemas;
+            for (const auto & alt : alts) {
+                alt_schemas.push_back(alt);
+            }
             return _add_rule(rule_name, _generate_union_rule(name, alt_schemas));
-        } else if (schema_type.is_array()) {
+        }
+        if (schema_type.is_array()) {
             std::vector<json> schema_types;
             for (const auto & t : schema_type) {
                 json schema_copy(schema);
@@ -834,15 +931,18 @@ public:
                 schema_types.push_back(schema_copy);
             }
             return _add_rule(rule_name, _generate_union_rule(name, schema_types));
-        } else if (schema.contains("const")) {
-            return _add_rule(rule_name, _generate_constant_rule(schema["const"]) + " space");
-        } else if (schema.contains("enum")) {
+        }
+        if (schema.contains("const")) {
+            return _add_rule(rule_name, _generate_constant_rule(schema["const"]));
+        }
+        if (schema.contains("enum")) {
             std::vector<std::string> enum_values;
             for (const auto & v : schema["enum"]) {
                 enum_values.push_back(_generate_constant_rule(v));
             }
-            return _add_rule(rule_name, "(" + string_join(enum_values, " | ") + ") space");
-        } else if ((schema_type.is_null() || schema_type == "object")
+            return _add_rule(rule_name, "(" + string_join(enum_values, " | ") + ")");
+        }
+        if ((schema_type.is_null() || schema_type == "object")
                 && (schema.contains("properties") ||
                     (schema.contains("additionalProperties") && schema["additionalProperties"] != true))) {
             std::unordered_set<std::string> required;
@@ -863,11 +963,12 @@ public:
                 _build_object_rule(
                     properties, required, name,
                     schema.contains("additionalProperties") ? schema["additionalProperties"] : json()));
-        } else if ((schema_type.is_null() || schema_type == "object" || schema_type == "string") && schema.contains("allOf")) {
+        }
+        if ((schema_type.is_null() || schema_type == "object" || schema_type == "string") && schema.contains("allOf")) {
             std::unordered_set<std::string> required;
             std::vector<std::pair<std::string, json>> properties;
             std::map<std::string, size_t> enum_values;
-            std::string hybrid_name = name;
+            const std::string& hybrid_name = name;
             std::function<void(const json &, bool)> add_component = [&](const json & comp_schema, bool is_required) {
                 if (comp_schema.contains("$ref")) {
                     add_component(_refs[comp_schema["$ref"]], is_required);
@@ -890,9 +991,9 @@ public:
                   // todo warning
                 }
             };
-            for (auto & t : schema["allOf"]) {
+            for (const auto & t : schema["allOf"]) {
                 if (t.contains("anyOf")) {
-                    for (auto & tt : t["anyOf"]) {
+                    for (const auto & tt : t["anyOf"]) {
                         add_component(tt, false);
                     }
                 } else {
@@ -907,11 +1008,12 @@ public:
                     }
                 }
                 if (!enum_intersection.empty()) {
-                    return _add_rule(rule_name, "(" + string_join(enum_intersection, " | ") + ") space");
+                    return _add_rule(rule_name, "(" + string_join(enum_intersection, " | ") + ")");
                 }
             }
             return _add_rule(rule_name, _build_object_rule(properties, required, hybrid_name, json()));
-        } else if ((schema_type.is_null() || schema_type == "array") && (schema.contains("items") || schema.contains("prefixItems"))) {
+        }
+        if ((schema_type.is_null() || schema_type == "array") && (schema.contains("items") || schema.contains("prefixItems"))) {
             json items = schema.contains("items") ? schema["items"] : schema["prefixItems"];
             if (items.is_array()) {
                 std::string rule = "\"[\" space ";
@@ -921,29 +1023,33 @@ public:
                     }
                     rule += visit(items[i], name + (name.empty() ? "" : "-") + "tuple-" + std::to_string(i));
                 }
-                rule += " \"]\" space";
+                rule += " space \"]\"";
                 return _add_rule(rule_name, rule);
-            } else {
-                std::string item_rule_name = visit(items, name + (name.empty() ? "" : "-") + "item");
-                int min_items = schema.contains("minItems") ? schema["minItems"].get<int>() : 0;
-                json max_items_json = schema.contains("maxItems") ? schema["maxItems"] : json();
-                int max_items = max_items_json.is_number_integer() ? max_items_json.get<int>() : std::numeric_limits<int>::max();
-
-                return _add_rule(rule_name, "\"[\" space " + build_repetition(item_rule_name, min_items, max_items, "\",\" space") + " \"]\" space");
             }
-        } else if ((schema_type.is_null() || schema_type == "string") && schema.contains("pattern")) {
+            std::string item_rule_name = visit(items, name + (name.empty() ? "" : "-") + "item");
+            int min_items = schema.contains("minItems") ? schema["minItems"].get<int>() : 0;
+            json max_items_json = schema.contains("maxItems") ? schema["maxItems"] : json();
+            int max_items = max_items_json.is_number_integer() ? max_items_json.get<int>() : std::numeric_limits<int>::max();
+
+            return _add_rule(rule_name, "\"[\" space " + build_repetition(item_rule_name, min_items, max_items, "\",\" space") + " space \"]\"");
+        }
+        if ((schema_type.is_null() || schema_type == "string") && schema.contains("pattern")) {
             return _visit_pattern(schema["pattern"], rule_name);
-        } else if ((schema_type.is_null() || schema_type == "string") && std::regex_match(schema_format, std::regex("^uuid[1-5]?$"))) {
+        }
+        if ((schema_type.is_null() || schema_type == "string") && std::regex_match(schema_format, std::regex("^uuid[1-5]?$"))) {
             return _add_primitive(rule_name == "root" ? "root" : schema_format, PRIMITIVE_RULES.at("uuid"));
-        } else if ((schema_type.is_null() || schema_type == "string") && STRING_FORMAT_RULES.find(schema_format + "-string") != STRING_FORMAT_RULES.end()) {
+        }
+        if ((schema_type.is_null() || schema_type == "string") && STRING_FORMAT_RULES.find(schema_format + "-string") != STRING_FORMAT_RULES.end()) {
             auto prim_name = schema_format + "-string";
             return _add_rule(rule_name, _add_primitive(prim_name, STRING_FORMAT_RULES.at(prim_name)));
-        } else if (schema_type == "string" && (schema.contains("minLength") || schema.contains("maxLength"))) {
+        }
+        if (schema_type == "string" && (schema.contains("minLength") || schema.contains("maxLength"))) {
             std::string char_rule = _add_primitive("char", PRIMITIVE_RULES.at("char"));
             int min_len = schema.contains("minLength") ? schema["minLength"].get<int>() : 0;
             int max_len = schema.contains("maxLength") ? schema["maxLength"].get<int>() : std::numeric_limits<int>::max();
-            return _add_rule(rule_name, "\"\\\"\" " + build_repetition(char_rule, min_len, max_len) + " \"\\\"\" space");
-        } else if (schema_type == "integer" && (schema.contains("minimum") || schema.contains("exclusiveMinimum") || schema.contains("maximum") || schema.contains("exclusiveMaximum"))) {
+            return _add_rule(rule_name, "\"\\\"\" " + build_repetition(char_rule, min_len, max_len) + " \"\\\"\"");
+        }
+        if (schema_type == "integer" && (schema.contains("minimum") || schema.contains("exclusiveMinimum") || schema.contains("maximum") || schema.contains("exclusiveMaximum"))) {
             int64_t min_value = std::numeric_limits<int64_t>::min();
             int64_t max_value = std::numeric_limits<int64_t>::max();
             if (schema.contains("minimum")) {
@@ -958,19 +1064,24 @@ public:
             }
             std::stringstream out;
             out << "(";
-            _build_min_max_int(min_value, max_value, out);
-            out << ") space";
+            build_min_max_int(min_value, max_value, out);
+            out << ")";
             return _add_rule(rule_name, out.str());
-        } else if (schema.empty() || schema_type == "object") {
-            return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
-        } else {
-            if (!schema_type.is_string() || PRIMITIVE_RULES.find(schema_type.get<std::string>()) == PRIMITIVE_RULES.end()) {
-                _errors.push_back("Unrecognized schema: " + schema.dump());
-                return "";
-            }
-            // TODO: support minimum, maximum, exclusiveMinimum, exclusiveMaximum at least for zero
-            return _add_primitive(rule_name == "root" ? "root" : schema_type.get<std::string>(), PRIMITIVE_RULES.at(schema_type.get<std::string>()));
         }
+        if (schema.empty() || schema_type == "object") {
+            return _add_rule(rule_name, _add_primitive("object", PRIMITIVE_RULES.at("object")));
+        }
+        if (schema_type.is_null() && schema.is_object()) {
+            // No type constraint and no recognized structural keywords (e.g. {"description": "..."}).
+            // Per JSON Schema semantics this is equivalent to {} and accepts any value.
+            return _add_rule(rule_name, _add_primitive("value", PRIMITIVE_RULES.at("value")));
+        }
+        if (!schema_type.is_string() || PRIMITIVE_RULES.find(schema_type.get<std::string>()) == PRIMITIVE_RULES.end()) {
+            _errors.push_back("Unrecognized schema: " + schema.dump());
+            return "";
+        }
+        // TODO: support minimum, maximum, exclusiveMinimum, exclusiveMaximum at least for zero
+        return _add_primitive(rule_name == "root" ? "root" : schema_type.get<std::string>(), PRIMITIVE_RULES.at(schema_type.get<std::string>()));
     }
 
     void check_errors() {
@@ -985,7 +1096,7 @@ public:
     std::string format_grammar() {
         std::stringstream ss;
         for (const auto & kv : _rules) {
-            ss << kv.first << " ::= " << kv.second << std::endl;
+            ss << kv.first << " ::= " << kv.second << '\n';
         }
         return ss.str();
     }
@@ -1003,7 +1114,7 @@ common_schema_info::~common_schema_info() = default;
 common_schema_info::common_schema_info(common_schema_info &&) noexcept = default;
 common_schema_info & common_schema_info::operator=(common_schema_info &&) noexcept = default;
 
-void common_schema_info::resolve_refs(nlohmann::ordered_json & schema) {
+void common_schema_info::resolve_refs(common_json & schema) {
     impl_->resolve_refs(schema, "");
 }
 
@@ -1011,7 +1122,7 @@ void common_schema_info::resolve_refs(nlohmann::ordered_json & schema) {
 // Some models emit raw string values rather than JSON-encoded strings for string parameters.
 // If any branch of the schema (via oneOf, anyOf, $ref, etc.) permits a string, this returns
 // true, allowing callers to handle the value as a raw string for simplicity.
-bool common_schema_info::resolves_to_string(const nlohmann::ordered_json & schema) {
+bool common_schema_info::resolves_to_string(const common_json & schema) {
     std::unordered_set<std::string> visited_refs;
 
     std::function<bool(const json &)> check = [&](const json & s) -> bool {
@@ -1119,7 +1230,7 @@ bool common_schema_info::resolves_to_string(const nlohmann::ordered_json & schem
     return check(schema);
 }
 
-std::string json_schema_to_grammar(const json & schema, bool force_gbnf) {
+std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) {
 #ifdef LLAMA_USE_LLGUIDANCE
     if (!force_gbnf) {
         return "%llguidance {}\nstart: %json " + schema.dump();
@@ -1140,10 +1251,10 @@ std::string build_grammar(const std::function<void(const common_grammar_builder 
         /* .add_rule = */ [&](const std::string & name, const std::string & rule) {
             return converter._add_rule(name, rule);
         },
-        /* .add_schema = */ [&](const std::string & name, const nlohmann::ordered_json & schema) {
+        /* .add_schema = */ [&](const std::string & name, const common_json & schema) {
             return converter.visit(schema, name == "root" ? "" : name);
         },
-        /* .resolve_refs = */ [&](nlohmann::ordered_json & schema) {
+        /* .resolve_refs = */ [&](common_json & schema) {
             converter.resolve_refs(schema, "");
         }
     };

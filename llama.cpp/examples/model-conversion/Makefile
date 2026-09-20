@@ -52,6 +52,10 @@ causal-convert-mm-model:
 	METADATA_OVERRIDE="$(METADATA_OVERRIDE)" \
 	./scripts/causal/convert-model.sh
 
+	$(MAKE) causal-convert-mmproj MM_OUTTYPE="$(MM_OUTTYPE)"
+
+causal-convert-mmproj:
+	$(call validate_model_path,causal-convert-mmproj)
 	@MODEL_NAME="$(MODEL_NAME)" OUTTYPE="$(MM_OUTTYPE)" MODEL_PATH="$(MODEL_PATH)" \
 	METADATA_OVERRIDE="$(METADATA_OVERRIDE)" \
 	./scripts/causal/convert-model.sh --mmproj
@@ -77,7 +81,10 @@ causal-verify-embeddings: causal-run-original-embeddings causal-run-converted-em
 	@./scripts/causal/compare-embeddings-logits.sh
 
 causal-inspect-original-model:
-	@./scripts/utils/inspect-org-model.py
+	@./scripts/utils/inspect-org-model.py --list-all -s
+
+causal-list-original-model-tensors:
+	@./scripts/utils/inspect-org-model.py --list-all-short -s
 
 causal-inspect-converted-model:
 	@./scripts/utils/inspect-converted-model.sh
@@ -153,7 +160,7 @@ embedding-verify-logits-st: embedding-run-original-model-st embedding-run-conver
 
 embedding-inspect-original-model:
 	$(call validate_embedding_model_path,embedding-inspect-original-model)
-	@EMBEDDING_MODEL_PATH="$(EMBEDDING_MODEL_PATH)" ./scripts/utils/inspect-org-model.py -m ${EMBEDDING_MODEL_PATH}
+	@EMBEDDING_MODEL_PATH="$(EMBEDDING_MODEL_PATH)" ./scripts/utils/inspect-org-model.py -m ${EMBEDDING_MODEL_PATH} --list-all -s
 
 embedding-inspect-converted-model:
 	@CONVERTED_EMBEDDING_MODEL="$(CONVERTED_EMBEDDING_MODEL)" ./scripts/utils/inspect-converted-model.sh ${CONVERTED_EMBEDDING_MODEL}

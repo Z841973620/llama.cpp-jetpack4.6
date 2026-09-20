@@ -8,28 +8,8 @@
 #ifndef CPPHTTPLIB_HTTPLIB_H
 #define CPPHTTPLIB_HTTPLIB_H
 
-#define CPPHTTPLIB_VERSION "0.31.0"
-#define CPPHTTPLIB_VERSION_NUM "0x001F00"
-
-/*
- * Platform compatibility check
- */
-
-#if defined(_WIN32) && !defined(_WIN64)
-#if defined(_MSC_VER)
-#pragma message(                                                               \
-    "cpp-httplib doesn't support 32-bit Windows. Please use a 64-bit compiler.")
-#else
-#warning                                                                       \
-    "cpp-httplib doesn't support 32-bit Windows. Please use a 64-bit compiler."
-#endif
-#elif defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ < 8
-#warning                                                                       \
-    "cpp-httplib doesn't support 32-bit platforms. Please use a 64-bit compiler."
-#elif defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
-#warning                                                                       \
-    "cpp-httplib doesn't support platforms where size_t is less than 64 bits."
-#endif
+#define CPPHTTPLIB_VERSION "0.53.1"
+#define CPPHTTPLIB_VERSION_NUM "0x003501"
 
 #ifdef _WIN32
 #if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00
@@ -158,6 +138,18 @@
 #define CPPHTTPLIB_RANGE_MAX_COUNT 1024
 #endif
 
+// std::regex_match's backtracking implementation (most acutely on libstdc++)
+// recurses roughly once per matched character for quantified patterns such
+// as "(.*)", so a long enough path can exhaust the calling thread's stack; on
+// a default ~8MB thread stack that has been observed to take on the order of
+// a couple thousand characters for a simple pattern. 256 leaves a wide safety
+// margin below that (well under the 8192-byte request URI limit) while still
+// fitting any realistic route segment; raise it if a route legitimately needs
+// longer paths. Regex routes are never applied to paths longer than this.
+#ifndef CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH
+#define CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH 256
+#endif
+
 #ifndef CPPHTTPLIB_TCP_NODELAY
 #define CPPHTTPLIB_TCP_NODELAY false
 #endif
@@ -185,6 +177,14 @@
                       : 0))
 #endif
 
+#ifndef CPPHTTPLIB_THREAD_POOL_MAX_COUNT
+#define CPPHTTPLIB_THREAD_POOL_MAX_COUNT (CPPHTTPLIB_THREAD_POOL_COUNT * 4)
+#endif
+
+#ifndef CPPHTTPLIB_THREAD_POOL_IDLE_TIMEOUT
+#define CPPHTTPLIB_THREAD_POOL_IDLE_TIMEOUT 3 // seconds
+#endif
+
 #ifndef CPPHTTPLIB_RECV_FLAGS
 #define CPPHTTPLIB_RECV_FLAGS 0
 #endif
@@ -194,11 +194,31 @@
 #endif
 
 #ifndef CPPHTTPLIB_LISTEN_BACKLOG
-#define CPPHTTPLIB_LISTEN_BACKLOG 5
+#define CPPHTTPLIB_LISTEN_BACKLOG 128
 #endif
 
 #ifndef CPPHTTPLIB_MAX_LINE_LENGTH
 #define CPPHTTPLIB_MAX_LINE_LENGTH 32768
+#endif
+
+#ifndef CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH
+#define CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH 16777216
+#endif
+
+#ifndef CPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND
+#define CPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND 300
+#endif
+
+#ifndef CPPHTTPLIB_WEBSOCKET_CLOSE_TIMEOUT_SECOND
+#define CPPHTTPLIB_WEBSOCKET_CLOSE_TIMEOUT_SECOND 5
+#endif
+
+#ifndef CPPHTTPLIB_WEBSOCKET_PING_INTERVAL_SECOND
+#define CPPHTTPLIB_WEBSOCKET_PING_INTERVAL_SECOND 30
+#endif
+
+#ifndef CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS
+#define CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS 0
 #endif
 
 /*
@@ -301,7 +321,6 @@ using socket_t = int;
 #include <array>
 #include <atomic>
 #include <cassert>
-#include <cctype>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
@@ -310,9 +329,11 @@ using socket_t = int;
 #include <errno.h>
 #include <exception>
 #include <fcntl.h>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <list>
 #include <map>
 #include <memory>
@@ -325,18 +346,48 @@ using socket_t = int;
 #include <sys/stat.h>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
+
+// On macOS with a TLS backend, enable Keychain root certificates by default
+// unless the user explicitly opts out. Not enabled on iOS/tvOS/watchOS since
+// the SecTrustSettings APIs used to enumerate anchor certificates are macOS
+// only; on those platforms the user must provide a CA bundle explicitly.
+#if defined(__APPLE__) && defined(__clang__) &&                                \
+    !defined(CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES) &&         \
+    (defined(CPPHTTPLIB_OPENSSL_SUPPORT) ||                                    \
+     defined(CPPHTTPLIB_MBEDTLS_SUPPORT) ||                                    \
+     defined(CPPHTTPLIB_WOLFSSL_SUPPORT))
+#if TARGET_OS_OSX
+#ifndef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#define CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#endif
+#endif
+#endif
+
+#if defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN) &&                      \
+    defined(__APPLE__) && !TARGET_OS_OSX
+#error                                                                         \
+    "CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN is only supported on macOS. On iOS/tvOS/watchOS, supply a CA bundle via set_ca_cert_path()."
+#endif
+
+// On Windows, enable Schannel certificate verification by default
+// unless the user explicitly opts out.
+#if defined(_WIN32) &&                                                         \
+    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#define CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
+#endif
 
 #if defined(CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO) ||                        \
     defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
-#if TARGET_OS_MAC
+#if TARGET_OS_MAC && defined(__clang__)
 #include <CFNetwork/CFHost.h>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
-#endif // CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO or
-       // CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#endif
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 #ifdef _WIN32
@@ -354,11 +405,11 @@ using socket_t = int;
 #endif
 #endif // _WIN32
 
-#if defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
-#if TARGET_OS_MAC
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#if TARGET_OS_OSX
 #include <Security/Security.h>
 #endif
-#endif // CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO
+#endif
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -384,41 +435,89 @@ using socket_t = int;
 #endif // CPPHTTPLIB_OPENSSL_SUPPORT
 
 #ifdef CPPHTTPLIB_MBEDTLS_SUPPORT
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
+// version.h defines MBEDTLS_VERSION_MAJOR (on 2.x/3.x/4.x alike); it is pulled
+// in with this first include group so the version gating below can use it.
 #include <mbedtls/error.h>
-#include <mbedtls/md5.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/oid.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/version.h>
+#include <mbedtls/x509_crt.h>
+#if MBEDTLS_VERSION_MAJOR >= 4
+// Mbed TLS 4.x moved hashing/RNG to PSA Crypto and removed these headers.
+#include <psa/crypto.h>
+#else
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/md5.h>
 #include <mbedtls/sha1.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/sha512.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/x509_crt.h>
+#endif
 #ifdef _WIN32
 #include <wincrypt.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "crypt32.lib")
 #endif
 #endif // _WIN32
-#if defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
-#if TARGET_OS_MAC
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#if TARGET_OS_OSX
 #include <Security/Security.h>
 #endif
-#endif // CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#endif
 
-// Mbed TLS 3.x API compatibility
+// Mbed TLS version API compatibility. Note: V4 implies V3 (both defined on
+// 4.x), so version-specific 3.x-only code must check V3 && !V4.
+#if MBEDTLS_VERSION_MAJOR >= 4
+#define CPPHTTPLIB_MBEDTLS_V4
+#endif
 #if MBEDTLS_VERSION_MAJOR >= 3
 #define CPPHTTPLIB_MBEDTLS_V3
 #endif
 
 #endif // CPPHTTPLIB_MBEDTLS_SUPPORT
 
+#ifdef CPPHTTPLIB_WOLFSSL_SUPPORT
+#include <wolfssl/options.h>
+
+#include <wolfssl/openssl/x509v3.h>
+
+// Fallback definitions for older wolfSSL versions (e.g., 5.6.6)
+#ifndef WOLFSSL_GEN_EMAIL
+#define WOLFSSL_GEN_EMAIL 1
+#endif
+#ifndef WOLFSSL_GEN_DNS
+#define WOLFSSL_GEN_DNS 2
+#endif
+#ifndef WOLFSSL_GEN_URI
+#define WOLFSSL_GEN_URI 6
+#endif
+#ifndef WOLFSSL_GEN_IPADD
+#define WOLFSSL_GEN_IPADD 7
+#endif
+
+#include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/hash.h>
+#include <wolfssl/wolfcrypt/md5.h>
+#include <wolfssl/wolfcrypt/sha256.h>
+#include <wolfssl/wolfcrypt/sha512.h>
+#ifdef _WIN32
+#include <wincrypt.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "crypt32.lib")
+#endif
+#endif // _WIN32
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#if TARGET_OS_OSX
+#include <Security/Security.h>
+#endif
+#endif
+#endif // CPPHTTPLIB_WOLFSSL_SUPPORT
+
 // Define CPPHTTPLIB_SSL_ENABLED if any SSL backend is available
-// This simplifies conditional compilation when adding new backends (e.g.,
-// wolfSSL)
-#if defined(CPPHTTPLIB_OPENSSL_SUPPORT) || defined(CPPHTTPLIB_MBEDTLS_SUPPORT)
+#if defined(CPPHTTPLIB_OPENSSL_SUPPORT) ||                                     \
+    defined(CPPHTTPLIB_MBEDTLS_SUPPORT) || defined(CPPHTTPLIB_WOLFSSL_SUPPORT)
 #define CPPHTTPLIB_SSL_ENABLED
 #endif
 
@@ -439,6 +538,10 @@ using socket_t = int;
  * Declaration
  */
 namespace httplib {
+
+namespace ws {
+class WebSocket;
+} // namespace ws
 
 namespace detail {
 
@@ -461,6 +564,21 @@ typename std::enable_if<std::is_array<T>::value, std::unique_ptr<T>>::type
 make_unique(std::size_t n) {
   typedef typename std::remove_extent<T>::type RT;
   return std::unique_ptr<T>(new RT[n]);
+}
+
+// Locale-independent ASCII character classification. The <cctype>
+// counterparts (std::isalnum, std::isdigit, ...) consult the global C locale,
+// so e.g. std::isalnum(0xC5) can return true once an embedder calls
+// setlocale(). HTTP grammars are defined over ASCII, so raw bytes must be
+// classified without regard to the locale.
+inline bool is_ascii_digit(char c) { return '0' <= c && c <= '9'; }
+
+inline bool is_ascii_alpha(char c) {
+  return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
+}
+
+inline bool is_ascii_alnum(char c) {
+  return is_ascii_digit(c) || is_ascii_alpha(c);
 }
 
 namespace case_ignore {
@@ -487,6 +605,14 @@ inline unsigned char to_lower(int c) {
       255,
   };
   return table[(unsigned char)(char)c];
+}
+
+inline std::string to_lower(const std::string &s) {
+  std::string result = s;
+  std::transform(
+      result.begin(), result.end(), result.begin(),
+      [](unsigned char c) { return static_cast<char>(to_lower(c)); });
+  return result;
 }
 
 inline bool equal(const std::string &a, const std::string &b) {
@@ -576,7 +702,7 @@ inline from_chars_result<T> from_chars(const char *first, const char *last,
   for (; p != last; ++p) {
     char c = *p;
     int digit = -1;
-    if ('0' <= c && c <= '9') {
+    if (is_ascii_digit(c)) {
       digit = c - '0';
     } else if ('a' <= c && c <= 'z') {
       digit = c - 'a' + 10;
@@ -597,27 +723,187 @@ inline from_chars_result<T> from_chars(const char *first, const char *last,
     return {first, std::errc::invalid_argument};
   }
 
-  value = negative ? -result : result;
+  value = negative ? T(0) - result : result;
   return {p, std::errc{}};
 }
 
-// from_chars for double (simple wrapper for strtod)
+// from_chars for double (hand-written, locale-independent)
+//
+// The only double consumed by this library is the HTTP quality value, whose
+// grammar is (RFC 9110 12.4.2):
+//   qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )
+// i.e. a non-negative decimal with no sign, exponent, "inf"/"nan", or wide
+// magnitude. So this parser recognizes exactly  1*DIGIT [ "." *DIGIT ]  with
+// '.' always the decimal separator (std::strtod would instead read it from the
+// global C locale, mis-parsing q-values once an embedder calls
+// setlocale(LC_ALL, "") into a comma-decimal locale). The caller range-checks
+// the result to [0, 1], so inputs outside that range need not be distinguished
+// here. Allocation-free, single pass, and free of the overflow/rounding edge
+// cases that exponent and wide-range handling would introduce.
 inline from_chars_result<double> from_chars(const char *first, const char *last,
                                             double &value) {
-  std::string s(first, last);
-  char *endptr = nullptr;
-  errno = 0;
-  value = std::strtod(s.c_str(), &endptr);
-  if (endptr == s.c_str()) { return {first, std::errc::invalid_argument}; }
-  if (errno == ERANGE) {
-    return {first + (endptr - s.c_str()), std::errc::result_out_of_range};
+  value = 0.0;
+  const char *p = first;
+
+  // Each 1eN is exactly representable, so a single final division by the
+  // matching entry yields a correctly-rounded result.
+  static const double powers_of_ten[] = {
+      1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8, 1e9,
+      1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
+  const int max_frac_digits =
+      static_cast<int>(sizeof(powers_of_ten) / sizeof(powers_of_ten[0])) - 1;
+
+  // Accumulate digits into a 64-bit integer and remember how many were
+  // fractional. Two independent caps keep this bounded and safe:
+  //   * accumulation saturates before mantissa could overflow uint64_t, and
+  //   * frac_digits is capped at max_frac_digits so it is always a valid index
+  //     into powers_of_ten (without this an input like "0.000...0" would never
+  //     grow mantissa, so the saturation cap alone would not bound it).
+  // Both caps only drop digits far beyond the precision a q-value needs; any
+  // value they would change is well outside [0, 1] and rejected by the caller.
+  uint64_t mantissa = 0;
+  int frac_digits = 0;
+  bool seen_digit = false;
+
+  const uint64_t limit = ((std::numeric_limits<uint64_t>::max)() - 9) / 10;
+  auto accumulate = [&](char c) {
+    if (mantissa <= limit) {
+      mantissa = mantissa * 10 + static_cast<uint64_t>(c - '0');
+      return true;
+    }
+    return false;
+  };
+
+  for (; p != last && is_ascii_digit(*p); ++p) {
+    seen_digit = true;
+    accumulate(*p);
   }
-  return {first + (endptr - s.c_str()), std::errc{}};
+
+  if (p != last && *p == '.') {
+    ++p;
+    for (; p != last && is_ascii_digit(*p); ++p) {
+      seen_digit = true;
+      if (frac_digits < max_frac_digits && accumulate(*p)) { ++frac_digits; }
+    }
+  }
+
+  if (!seen_digit) { return {first, std::errc::invalid_argument}; }
+
+  value = static_cast<double>(mantissa) / powers_of_ten[frac_digits];
+  return {p, std::errc{}};
+}
+
+inline bool parse_port(const char *s, size_t len, int &port) {
+  int val = 0;
+  auto r = from_chars(s, s + len, val);
+  if (r.ec != std::errc{} || val < 1 || val > 65535) { return false; }
+  port = val;
+  return true;
+}
+
+inline bool parse_port(const std::string &s, int &port) {
+  return parse_port(s.data(), s.size(), port);
+}
+
+struct UrlComponents {
+  std::string scheme;
+  std::string host;
+  std::string port;
+  std::string path;
+  std::string query;
+};
+
+inline bool parse_url(const std::string &url, UrlComponents &uc) {
+  uc = {};
+  size_t pos = 0;
+
+  auto sep = url.find("://");
+  if (sep != std::string::npos) {
+    uc.scheme = url.substr(0, sep);
+
+    // Scheme must be [a-z]+ only
+    if (uc.scheme.empty()) { return false; }
+    for (auto c : uc.scheme) {
+      if (c < 'a' || c > 'z') { return false; }
+    }
+
+    pos = sep + 3;
+  } else if (url.compare(0, 2, "//") == 0) {
+    pos = 2;
+  }
+
+  auto has_authority_prefix = pos > 0;
+  auto has_authority = has_authority_prefix || (!url.empty() && url[0] != '/' &&
+                                                url[0] != '?' && url[0] != '#');
+  if (has_authority) {
+    if (pos < url.size() && url[pos] == '[') {
+      auto close = url.find(']', pos);
+      if (close == std::string::npos) { return false; }
+      uc.host = url.substr(pos + 1, close - pos - 1);
+
+      // IPv6 host must be [a-fA-F0-9:]+ only
+      if (uc.host.empty()) { return false; }
+      for (auto c : uc.host) {
+        if (!(is_ascii_digit(c) || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F') || c == ':')) {
+          return false;
+        }
+      }
+
+      pos = close + 1;
+
+      // The IPv6 literal is the whole host, so ']' must be followed by a port,
+      // path, query or fragment delimiter (or the end of input). Otherwise the
+      // trailing bytes would be folded into the path while the connection
+      // still targets the bracketed address.
+      if (pos < url.size()) {
+        auto c = url[pos];
+        if (c != ':' && c != '/' && c != '?' && c != '#') { return false; }
+      }
+    } else {
+      auto end = url.find_first_of(":/?#", pos);
+      if (end == std::string::npos) { end = url.size(); }
+      uc.host = url.substr(pos, end - pos);
+      pos = end;
+    }
+
+    if (pos < url.size() && url[pos] == ':') {
+      ++pos;
+      auto end = url.find_first_of("/?#", pos);
+      if (end == std::string::npos) { end = url.size(); }
+      uc.port = url.substr(pos, end - pos);
+      pos = end;
+    }
+
+    // Without :// or //, the entire input must be consumed as host[:port].
+    // If there is leftover (path, query, etc.), this is not a valid
+    // host[:port] string — clear and reparse as a plain path.
+    if (!has_authority_prefix && pos < url.size()) {
+      uc.host.clear();
+      uc.port.clear();
+      pos = 0;
+    }
+  }
+
+  if (pos < url.size() && url[pos] != '?' && url[pos] != '#') {
+    auto end = url.find_first_of("?#", pos);
+    if (end == std::string::npos) { end = url.size(); }
+    uc.path = url.substr(pos, end - pos);
+    pos = end;
+  }
+
+  if (pos < url.size() && url[pos] == '?') {
+    auto end = url.find('#', pos);
+    if (end == std::string::npos) { end = url.size(); }
+    uc.query = url.substr(pos, end - pos);
+  }
+
+  return true;
 }
 
 } // namespace detail
 
-enum SSLVerifierResponse {
+enum class SSLVerifierResponse {
   // no decision has been made, use the built-in certificate verifier
   NoDecisionMade,
   // connection certificate is verified and accepted
@@ -625,6 +911,11 @@ enum SSLVerifierResponse {
   // connection certificate was processed but is rejected
   CertificateRejected
 };
+
+// System CA loading policy for SSL clients. Auto (the default) loads system
+// CA certs only when no custom CA is configured; enable_system_ca() switches
+// to an explicit policy.
+enum class SystemCAMode { Auto, Enabled, Disabled };
 
 enum StatusCode {
   // Information responses
@@ -701,15 +992,380 @@ enum StatusCode {
   NetworkAuthenticationRequired_511 = 511,
 };
 
-using Headers =
-    std::unordered_multimap<std::string, std::string, detail::case_ignore::hash,
-                            detail::case_ignore::equal_to>;
+namespace detail {
 
-using Params = std::multimap<std::string, std::string>;
+// A multimap that keeps its entries in the order they were inserted.
+//
+// HTTP needs that order in two places. RFC 9110 5.3 makes the order of header
+// fields sharing a field name significant and forbids a proxy from reordering
+// them, and a query string's parameters are meaningful in the order the caller
+// wrote them. Neither standard container expresses it: std::unordered_multimap
+// gives no ordering guarantee at all for equivalent keys (libstdc++ yields
+// reverse insertion order, libc++ insertion order), and std::multimap sorts by
+// key, which would drop control data such as Host behind whatever else the
+// message carries and alphabetise a query string.
+//
+// Entries are therefore kept in a flat vector, in order. Lookup is a linear
+// scan, which beats hashing for the handful of entries a message carries
+// (headers are capped at CPPHTTPLIB_HEADER_MAX_COUNT).
+//
+// KeyEqual compares keys; it is what makes Headers case-insensitive and
+// Params, whose parameter names are case-sensitive, not.
+template <typename Mapped, typename KeyEqual> class insertion_ordered_multimap {
+public:
+  using key_type = std::string;
+  using mapped_type = Mapped;
+  using value_type = std::pair<std::string, Mapped>;
+  using size_type = std::size_t;
+  using difference_type = std::ptrdiff_t;
+  using reference = value_type &;
+  using const_reference = const value_type &;
+
+private:
+  static size_type npos() { return static_cast<size_type>(-1); }
+
+  static bool keys_equal(const std::string &a, const std::string &b) {
+    return KeyEqual()(a, b);
+  }
+
+  // Iterating yields every entry in insertion order, but equal_range() and
+  // find() have to walk only the entries sharing one key, which are not
+  // adjacent. Both are the same iterator type: key_idx_ selects between the
+  // two traversals, and since equality compares only the position, an iterator
+  // restricted to one key still compares equal to end().
+  template <typename V> class iterator_t {
+  public:
+    using iterator_category = std::bidirectional_iterator_tag;
+    using value_type = insertion_ordered_multimap::value_type;
+    using difference_type = insertion_ordered_multimap::difference_type;
+    using pointer = V *;
+    using reference = V &;
+
+    iterator_t() : data_(nullptr), idx_(0), size_(0), key_idx_(npos()) {}
+
+    template <typename U,
+              typename std::enable_if<std::is_convertible<U *, V *>::value,
+                                      int>::type = 0>
+    iterator_t(const iterator_t<U> &rhs)
+        : data_(rhs.data_), idx_(rhs.idx_), size_(rhs.size_),
+          key_idx_(rhs.key_idx_) {}
+
+    reference operator*() const { return data_[idx_]; }
+    pointer operator->() const { return data_ + idx_; }
+
+    iterator_t &operator++() {
+      // Saturating, so that advancing past the last entry of a key (which
+      // get_multimap_value() does when asked for an out-of-range id) stays at
+      // end() instead of running off the container.
+      if (idx_ >= size_) { return *this; }
+      ++idx_;
+      if (key_idx_ != npos()) {
+        while (idx_ < size_ && !matches(idx_)) {
+          ++idx_;
+        }
+      }
+      return *this;
+    }
+
+    iterator_t operator++(int) {
+      auto tmp = *this;
+      ++*this;
+      return tmp;
+    }
+
+    iterator_t &operator--() {
+      if (idx_ == 0) { return *this; }
+      --idx_;
+      if (key_idx_ != npos()) {
+        while (idx_ > 0 && !matches(idx_)) {
+          --idx_;
+        }
+      }
+      return *this;
+    }
+
+    iterator_t operator--(int) {
+      auto tmp = *this;
+      --*this;
+      return tmp;
+    }
+
+    template <typename U> bool operator==(const iterator_t<U> &rhs) const {
+      return idx_ == rhs.idx_;
+    }
+
+    template <typename U> bool operator!=(const iterator_t<U> &rhs) const {
+      return idx_ != rhs.idx_;
+    }
+
+  private:
+    friend class insertion_ordered_multimap;
+    template <typename> friend class iterator_t;
+
+    iterator_t(V *data, size_type idx, size_type size, size_type key_idx)
+        : data_(data), idx_(idx), size_(size), key_idx_(key_idx) {}
+
+    bool matches(size_type i) const {
+      return keys_equal(data_[i].first, data_[key_idx_].first);
+    }
+
+    V *data_;
+    size_type idx_;
+    size_type size_;
+    size_type key_idx_;
+  };
+
+public:
+  using iterator = iterator_t<value_type>;
+  using const_iterator = iterator_t<const value_type>;
+
+  insertion_ordered_multimap() = default;
+  insertion_ordered_multimap(std::initializer_list<value_type> il)
+      : entries_(il) {}
+  template <typename InputIt>
+  insertion_ordered_multimap(InputIt first, InputIt last)
+      : entries_(first, last) {}
+
+  iterator begin() { return make_iter(0, npos()); }
+  iterator end() { return make_iter(entries_.size(), npos()); }
+  const_iterator begin() const { return make_citer(0, npos()); }
+  const_iterator end() const { return make_citer(entries_.size(), npos()); }
+  const_iterator cbegin() const { return begin(); }
+  const_iterator cend() const { return end(); }
+
+  bool empty() const { return entries_.empty(); }
+  size_type size() const { return entries_.size(); }
+  void clear() { entries_.clear(); }
+  void swap(insertion_ordered_multimap &rhs) { entries_.swap(rhs.entries_); }
+
+  iterator insert(const value_type &val) {
+    entries_.push_back(val);
+    return make_iter(entries_.size() - 1, npos());
+  }
+
+  iterator insert(value_type &&val) {
+    entries_.push_back(std::move(val));
+    return make_iter(entries_.size() - 1, npos());
+  }
+
+  template <typename... Args> iterator emplace(Args &&...args) {
+    entries_.emplace_back(std::forward<Args>(args)...);
+    return make_iter(entries_.size() - 1, npos());
+  }
+
+  // For entries that have to lead the message, such as the Host header field
+  // (RFC 9110 5.3 recommends sending control data first).
+  template <typename... Args> iterator emplace_front(Args &&...args) {
+    entries_.emplace(entries_.begin(), std::forward<Args>(args)...);
+    return make_iter(0, npos());
+  }
+
+  iterator find(const std::string &key) {
+    auto i = index_of(key);
+    return i == npos() ? end() : make_iter(i, i);
+  }
+
+  const_iterator find(const std::string &key) const {
+    auto i = index_of(key);
+    return i == npos() ? end() : make_citer(i, i);
+  }
+
+  size_type count(const std::string &key) const {
+    size_type n = 0;
+    for (const auto &entry : entries_) {
+      if (keys_equal(entry.first, key)) { n++; }
+    }
+    return n;
+  }
+
+  std::pair<iterator, iterator> equal_range(const std::string &key) {
+    auto i = index_of(key);
+    return i == npos() ? std::make_pair(end(), end())
+                       : std::make_pair(make_iter(i, i), end());
+  }
+
+  std::pair<const_iterator, const_iterator>
+  equal_range(const std::string &key) const {
+    auto i = index_of(key);
+    return i == npos() ? std::make_pair(end(), end())
+                       : std::make_pair(make_citer(i, i), end());
+  }
+
+  size_type erase(const std::string &key) {
+    auto before = entries_.size();
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                  [&](const value_type &entry) {
+                                    return keys_equal(entry.first, key);
+                                  }),
+                   entries_.end());
+    return before - entries_.size();
+  }
+
+  iterator erase(const_iterator pos) {
+    entries_.erase(entries_.begin() + static_cast<difference_type>(pos.idx_));
+    return make_iter(pos.idx_, npos());
+  }
+
+  // Erases what iterating [first, last) would actually visit, so erasing an
+  // equal_range() removes only the entries with that key, not everything
+  // positioned between them.
+  iterator erase(const_iterator first, const_iterator last) {
+    auto from = first.idx_;
+    auto to = last.idx_;
+    if (from >= to) { return make_iter(from, npos()); }
+
+    auto begin_it = entries_.begin();
+    auto from_it = begin_it + static_cast<difference_type>(from);
+    auto to_it = begin_it + static_cast<difference_type>(to);
+
+    if (first.key_idx_ == npos()) {
+      entries_.erase(from_it, to_it);
+    } else {
+      auto key = entries_[first.key_idx_].first;
+      auto keep = from_it;
+      for (auto it = from_it; it != to_it; ++it) {
+        if (!keys_equal(it->first, key)) {
+          if (keep != it) { *keep = std::move(*it); }
+          ++keep;
+        }
+      }
+      if (keep != to_it) {
+        keep = std::move(to_it, entries_.end(), keep);
+      } else {
+        keep = entries_.end();
+      }
+      entries_.erase(keep, entries_.end());
+    }
+    return make_iter(from, npos());
+  }
+
+  friend bool operator==(const insertion_ordered_multimap &lhs,
+                         const insertion_ordered_multimap &rhs) {
+    return lhs.entries_ == rhs.entries_;
+  }
+
+  friend bool operator!=(const insertion_ordered_multimap &lhs,
+                         const insertion_ordered_multimap &rhs) {
+    return !(lhs == rhs);
+  }
+
+private:
+  size_type index_of(const std::string &key) const {
+    for (size_type i = 0; i < entries_.size(); i++) {
+      if (keys_equal(entries_[i].first, key)) { return i; }
+    }
+    return npos();
+  }
+
+  iterator make_iter(size_type idx, size_type key_idx) {
+    return iterator(entries_.data(), idx, entries_.size(), key_idx);
+  }
+
+  const_iterator make_citer(size_type idx, size_type key_idx) const {
+    return const_iterator(entries_.data(), idx, entries_.size(), key_idx);
+  }
+
+  std::vector<value_type> entries_;
+};
+
+} // namespace detail
+
+using Headers =
+    detail::insertion_ordered_multimap<std::string,
+                                       detail::case_ignore::equal_to>;
+
+// Query parameter names are case-sensitive, unlike header field names.
+using Params =
+    detail::insertion_ordered_multimap<std::string, std::equal_to<std::string>>;
 using Match = std::smatch;
 
 using DownloadProgress = std::function<bool(size_t current, size_t total)>;
 using UploadProgress = std::function<bool(size_t current, size_t total)>;
+
+/*
+ * detail: type-erased storage used by UserData.
+ * ABI-stable regardless of C++ standard — always uses this custom
+ * implementation instead of std::any.
+ */
+namespace detail {
+
+using any_type_id = const void *;
+
+template <typename T> any_type_id any_typeid() noexcept {
+  static const char id = 0;
+  return &id;
+}
+
+struct any_storage {
+  virtual ~any_storage() = default;
+  virtual std::unique_ptr<any_storage> clone() const = 0;
+  virtual any_type_id type_id() const noexcept = 0;
+};
+
+template <typename T> struct any_value final : any_storage {
+  T value;
+  template <typename U> explicit any_value(U &&v) : value(std::forward<U>(v)) {}
+  std::unique_ptr<any_storage> clone() const override {
+    return std::unique_ptr<any_storage>(new any_value<T>(value));
+  }
+  any_type_id type_id() const noexcept override { return any_typeid<T>(); }
+};
+
+} // namespace detail
+
+class UserData {
+public:
+  UserData() = default;
+  UserData(UserData &&) noexcept = default;
+  UserData &operator=(UserData &&) noexcept = default;
+
+  UserData(const UserData &o) {
+    for (const auto &e : o.entries_) {
+      if (e.second) { entries_[e.first] = e.second->clone(); }
+    }
+  }
+
+  UserData &operator=(const UserData &o) {
+    if (this != &o) {
+      entries_.clear();
+      for (const auto &e : o.entries_) {
+        if (e.second) { entries_[e.first] = e.second->clone(); }
+      }
+    }
+    return *this;
+  }
+
+  template <typename T> void set(const std::string &key, T &&value) {
+    using D = typename std::decay<T>::type;
+    entries_[key].reset(new detail::any_value<D>(std::forward<T>(value)));
+  }
+
+  template <typename T> T *get(const std::string &key) noexcept {
+    auto it = entries_.find(key);
+    if (it == entries_.end() || !it->second) { return nullptr; }
+    if (it->second->type_id() != detail::any_typeid<T>()) { return nullptr; }
+    return &static_cast<detail::any_value<T> *>(it->second.get())->value;
+  }
+
+  template <typename T> const T *get(const std::string &key) const noexcept {
+    auto it = entries_.find(key);
+    if (it == entries_.end() || !it->second) { return nullptr; }
+    if (it->second->type_id() != detail::any_typeid<T>()) { return nullptr; }
+    return &static_cast<const detail::any_value<T> *>(it->second.get())->value;
+  }
+
+  bool has(const std::string &key) const noexcept {
+    return entries_.find(key) != entries_.end();
+  }
+
+  void erase(const std::string &key) { entries_.erase(key); }
+
+  void clear() noexcept { entries_.clear(); }
+
+private:
+  std::unordered_map<std::string, std::unique_ptr<detail::any_storage>>
+      entries_;
+};
 
 struct Response;
 using ResponseHandler = std::function<bool(const Response &response)>;
@@ -727,9 +1383,16 @@ struct FormField {
   std::string content;
   Headers headers;
 };
-using FormFields = std::multimap<std::string, FormField>;
+// RFC 7578 5.2: a form processor "SHOULD send back results in order" and
+// "Intermediaries MUST NOT reorder the results", so a handler walking these
+// should see the parts as they were sent. A std::multimap sorts by field name
+// and loses that. Field names are case-sensitive, hence std::equal_to rather
+// than the case-insensitive predicate Headers uses.
+using FormFields =
+    detail::insertion_ordered_multimap<FormField, std::equal_to<std::string>>;
 
-using FormFiles = std::multimap<std::string, FormData>;
+using FormFiles =
+    detail::insertion_ordered_multimap<FormData, std::equal_to<std::string>>;
 
 struct MultipartFormData {
   FormFields fields; // Text fields from multipart
@@ -778,8 +1441,8 @@ private:
 
   protected:
     std::streamsize xsputn(const char *s, std::streamsize n) override {
-      sink_.write(s, static_cast<size_t>(n));
-      return n;
+      if (sink_.write(s, static_cast<size_t>(n))) { return n; }
+      return 0;
     }
 
   private:
@@ -804,6 +1467,63 @@ struct FormDataProvider {
   std::string content_type;
 };
 using FormDataProviderItems = std::vector<FormDataProvider>;
+
+inline FormDataProvider
+make_file_provider(const std::string &name, const std::string &filepath,
+                   const std::string &filename = std::string(),
+                   const std::string &content_type = std::string()) {
+  FormDataProvider fdp;
+  fdp.name = name;
+  fdp.filename = filename.empty() ? filepath : filename;
+  fdp.content_type = content_type;
+  fdp.provider = [filepath](size_t offset, DataSink &sink) -> bool {
+    std::ifstream f(filepath, std::ios::binary);
+    if (!f) { return false; }
+    if (offset > 0) {
+      f.seekg(static_cast<std::streamoff>(offset));
+      if (!f.good()) {
+        sink.done();
+        return true;
+      }
+    }
+    char buf[8192];
+    f.read(buf, sizeof(buf));
+    auto n = static_cast<size_t>(f.gcount());
+    if (n > 0) { return sink.write(buf, n); }
+    sink.done(); // EOF
+    return true;
+  };
+  return fdp;
+}
+
+inline std::pair<size_t, ContentProvider>
+make_file_body(const std::string &filepath) {
+  size_t size = 0;
+  {
+    std::ifstream f(filepath, std::ios::binary | std::ios::ate);
+    if (!f) { return {0, ContentProvider{}}; }
+    size = static_cast<size_t>(f.tellg());
+  }
+
+  ContentProvider provider = [filepath](size_t offset, size_t length,
+                                        DataSink &sink) -> bool {
+    std::ifstream f(filepath, std::ios::binary);
+    if (!f) { return false; }
+    f.seekg(static_cast<std::streamoff>(offset));
+    if (!f.good()) { return false; }
+    char buf[8192];
+    while (length > 0) {
+      auto to_read = (std::min)(sizeof(buf), length);
+      f.read(buf, static_cast<std::streamsize>(to_read));
+      auto n = static_cast<size_t>(f.gcount());
+      if (n == 0) { break; }
+      if (!sink.write(buf, n)) { return false; }
+      length -= n;
+    }
+    return true;
+  };
+  return {size, std::move(provider)};
+}
 
 using ContentReceiverWithProgress = std::function<bool(
     const char *data, size_t data_length, size_t offset, size_t total_length)>;
@@ -981,11 +1701,13 @@ struct Request {
 
   bool has_param(const std::string &key) const;
   std::string get_param_value(const std::string &key, size_t id = 0) const;
+  std::vector<std::string> get_param_values(const std::string &key) const;
   size_t get_param_value_count(const std::string &key) const;
 
   bool is_multipart_form_data() const;
 
   // private members...
+  bool body_consumed_ = false;
   size_t redirect_count_ = CPPHTTPLIB_REDIRECT_MAX_COUNT;
   size_t content_length_ = 0;
   ContentProvider content_provider_;
@@ -1009,6 +1731,10 @@ struct Response {
   Headers trailers;
   std::string body;
   std::string location; // Redirect location
+
+  // User-defined context — set by pre-routing/pre-request handlers and read
+  // by route handlers to pass arbitrary data (e.g. decoded auth tokens).
+  UserData user_data;
 
   bool has_header(const std::string &key) const;
   std::string get_header_value(const std::string &key, const char *def = "",
@@ -1099,6 +1825,8 @@ enum class Error {
   UnsupportedAddressFamily,
   HTTPParsing,
   InvalidRangeHeader,
+  UnsupportedContentEncoding,
+  WebSocketHandshake,
 
   // For internal use only
   SSLPeerCouldBeClosed_,
@@ -1115,6 +1843,7 @@ public:
   virtual bool is_readable() const = 0;
   virtual bool wait_readable() const = 0;
   virtual bool wait_writable() const = 0;
+  virtual bool is_peer_alive() const { return wait_writable(); }
 
   virtual ssize_t read(char *ptr, size_t size) = 0;
   virtual ssize_t write(const char *ptr, size_t size) = 0;
@@ -1123,6 +1852,23 @@ public:
   virtual socket_t socket() const = 0;
 
   virtual time_t duration() const = 0;
+
+  virtual void set_read_timeout(time_t sec, time_t usec = 0) {
+    (void)sec;
+    (void)usec;
+  }
+
+  // Bytes already pulled off the socket and sitting in this stream's own
+  // buffer. Exposing them lets a line reader scan for a terminator in one
+  // pass instead of asking for a byte at a time. A stream that does no
+  // buffering of its own reports none, and readers fall back to read().
+  virtual const char *buffered_data(size_t &size) const {
+    size = 0;
+    return nullptr;
+  }
+
+  // Discards `size` bytes previously returned by buffered_data().
+  virtual void consume_buffered(size_t size) { (void)size; }
 
   ssize_t write(const char *ptr);
   ssize_t write(const std::string &s);
@@ -1146,7 +1892,9 @@ public:
 
 class ThreadPool final : public TaskQueue {
 public:
-  explicit ThreadPool(size_t n, size_t mqr = 0);
+  explicit ThreadPool(
+      size_t n, size_t max_n = 0, size_t mqr = 0,
+      time_t idle_timeout_sec = CPPHTTPLIB_THREAD_POOL_IDLE_TIMEOUT);
   ThreadPool(const ThreadPool &) = delete;
   ~ThreadPool() override = default;
 
@@ -1154,20 +1902,23 @@ public:
   void shutdown() override;
 
 private:
-  struct worker {
-    explicit worker(ThreadPool &pool);
+  void worker(bool is_dynamic);
+  void move_to_finished(std::thread::id id);
+  void cleanup_finished_threads();
 
-    void operator()();
-
-    ThreadPool &pool_;
-  };
-  friend struct worker;
-
-  std::vector<std::thread> threads_;
-  std::list<std::function<void()>> jobs_;
+  size_t base_thread_count_;
+  size_t max_thread_count_;
+  size_t max_queued_requests_;
+  time_t idle_timeout_sec_;
+  size_t idle_thread_count_;
 
   bool shutdown_;
-  size_t max_queued_requests_ = 0;
+
+  std::list<std::function<void()>> jobs_;
+  std::vector<std::thread> threads_;       // base threads
+  std::list<std::thread> dynamic_threads_; // dynamic threads
+  std::vector<std::thread>
+      finished_threads_; // exited dynamic threads awaiting join
 
   std::condition_variable cond_;
   std::mutex mutex_;
@@ -1182,6 +1933,8 @@ using ErrorLogger = std::function<void(const Error &, const Request *)>;
 using SocketOptions = std::function<void(socket_t sock)>;
 
 void default_socket_options(socket_t sock);
+
+bool set_socket_opt(socket_t sock, int level, int optname, int optval);
 
 const char *status_message(int status);
 
@@ -1265,14 +2018,50 @@ private:
   std::regex regex_;
 };
 
-int close_socket(socket_t sock);
+int close_socket(socket_t sock) noexcept;
 
 ssize_t write_headers(Stream &strm, const Headers &headers);
 
 bool set_socket_opt_time(socket_t sock, int level, int optname, time_t sec,
                          time_t usec);
 
+size_t get_multipart_content_length(const UploadFormDataItems &items,
+                                    const std::string &boundary);
+
+ContentProvider
+make_multipart_content_provider(const UploadFormDataItems &items,
+                                const std::string &boundary);
+
 } // namespace detail
+
+bool is_valid_multipart_boundary(const std::string &boundary);
+
+// Serializer for multipart/form-data request bodies. The boundary is owned
+// by the writer so that per-part framing and the final terminator always
+// agree. Field names and filenames are escaped following the WHATWG HTML
+// standard ('"' -> %22, CR -> %0D, LF -> %0A); CR and LF are also escaped
+// in content types.
+class MultipartFormDataWriter {
+public:
+  MultipartFormDataWriter();
+  // precondition: is_valid_multipart_boundary(boundary)
+  explicit MultipartFormDataWriter(std::string boundary);
+
+  const std::string &boundary() const;
+  std::string content_type() const;
+
+  // In-memory items -> whole body (known length)
+  std::string serialize(const UploadFormDataItems &items) const;
+  size_t content_length(const UploadFormDataItems &items) const;
+
+  // Per-part framing for streaming via a content provider
+  std::string item_begin(const UploadFormData &item) const;
+  static std::string item_end();
+  std::string finish() const;
+
+private:
+  std::string boundary_;
+};
 
 class Server {
 public:
@@ -1294,6 +2083,13 @@ public:
   using Expect100ContinueHandler =
       std::function<int(const Request &, Response &)>;
 
+  using StartHandler = std::function<void()>;
+
+  using WebSocketHandler =
+      std::function<void(const Request &, ws::WebSocket &)>;
+  using SubProtocolSelector =
+      std::function<std::string(const std::vector<std::string> &protocols)>;
+
   Server();
 
   virtual ~Server();
@@ -1310,6 +2106,10 @@ public:
   Server &Delete(const std::string &pattern, Handler handler);
   Server &Delete(const std::string &pattern, HandlerWithContentReader handler);
   Server &Options(const std::string &pattern, Handler handler);
+
+  Server &WebSocket(const std::string &pattern, WebSocketHandler handler);
+  Server &WebSocket(const std::string &pattern, WebSocketHandler handler,
+                    SubProtocolSelector sub_protocol_selector);
 
   bool set_base_dir(const std::string &dir,
                     const std::string &mount_point = std::string());
@@ -1336,6 +2136,9 @@ public:
   Server &set_pre_request_handler(HandlerWithResponse handler);
 
   Server &set_expect_100_continue_handler(Expect100ContinueHandler handler);
+
+  Server &set_start_handler(StartHandler handler);
+
   Server &set_logger(Logger logger);
   Server &set_pre_compression_logger(Logger logger);
   Server &set_error_logger(ErrorLogger error_logger);
@@ -1353,6 +2156,9 @@ public:
 
   Server &set_keep_alive_max_count(size_t count);
   Server &set_keep_alive_timeout(time_t sec);
+  template <class Rep, class Period>
+  Server &
+  set_keep_alive_timeout(const std::chrono::duration<Rep, Period> &duration);
 
   Server &set_read_timeout(time_t sec, time_t usec = 0);
   template <class Rep, class Period>
@@ -1368,6 +2174,13 @@ public:
 
   Server &set_payload_max_length(size_t length);
 
+  Server &set_websocket_ping_interval(time_t sec);
+  template <class Rep, class Period>
+  Server &set_websocket_ping_interval(
+      const std::chrono::duration<Rep, Period> &duration);
+
+  Server &set_websocket_max_missed_pongs(int count);
+
   bool bind_to_port(const std::string &host, int port, int socket_flags = 0);
   int bind_to_any_port(const std::string &host, int socket_flags = 0);
   bool listen_after_bind();
@@ -1376,7 +2189,7 @@ public:
 
   bool is_running() const;
   void wait_until_ready() const;
-  void stop();
+  void stop() noexcept;
   void decommission();
 
   std::function<TaskQueue *(void)> new_task_queue;
@@ -1386,7 +2199,8 @@ protected:
                        int remote_port, const std::string &local_addr,
                        int local_port, bool close_connection,
                        bool &connection_closed,
-                       const std::function<void(Request &)> &setup_request);
+                       const std::function<void(Request &)> &setup_request,
+                       bool *websocket_upgraded = nullptr);
 
   std::atomic<socket_t> svr_sock_{INVALID_SOCKET};
 
@@ -1401,6 +2215,9 @@ protected:
   time_t idle_interval_sec_ = CPPHTTPLIB_IDLE_INTERVAL_SECOND;
   time_t idle_interval_usec_ = CPPHTTPLIB_IDLE_INTERVAL_USECOND;
   size_t payload_max_length_ = CPPHTTPLIB_PAYLOAD_MAX_LENGTH;
+  time_t websocket_ping_interval_sec_ =
+      CPPHTTPLIB_WEBSOCKET_PING_INTERVAL_SECOND;
+  int websocket_max_missed_pongs_ = CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS;
 
 private:
   using Handlers =
@@ -1411,6 +2228,14 @@ private:
 
   static std::unique_ptr<detail::MatcherBase>
   make_matcher(const std::string &pattern);
+
+  template <typename H>
+  Server &add_handler(
+      std::vector<std::pair<std::unique_ptr<detail::MatcherBase>, H>> &handlers,
+      const std::string &pattern, H handler) {
+    handlers.emplace_back(make_matcher(pattern), std::move(handler));
+    return *this;
+  }
 
   Server &set_error_handler_core(HandlerWithResponse handler, std::true_type);
   Server &set_error_handler_core(Handler handler, std::false_type);
@@ -1427,8 +2252,8 @@ private:
                              const std::string &etag, time_t mtime) const;
   bool check_if_range(Request &req, const std::string &etag,
                       time_t mtime) const;
-  bool dispatch_request(Request &req, Response &res,
-                        const Handlers &handlers) const;
+  bool dispatch_request(Request &req, Response &res, const Handlers &handlers,
+                        Stream &strm);
   bool dispatch_request_for_content_reader(
       Request &req, Response &res, ContentReader content_reader,
       const HandlersForContentReader &handlers) const;
@@ -1470,6 +2295,7 @@ private:
   struct MountPointEntry {
     std::string mount_point;
     std::string base_dir;
+    std::string resolved_base_dir;
     Headers headers;
   };
   std::vector<MountPointEntry> base_dirs_;
@@ -1488,12 +2314,21 @@ private:
   HandlersForContentReader delete_handlers_for_content_reader_;
   Handlers options_handlers_;
 
+  struct WebSocketHandlerEntry {
+    std::unique_ptr<detail::MatcherBase> matcher;
+    WebSocketHandler handler;
+    SubProtocolSelector sub_protocol_selector;
+  };
+  using WebSocketHandlers = std::vector<WebSocketHandlerEntry>;
+  WebSocketHandlers websocket_handlers_;
+
   HandlerWithResponse error_handler_;
   ExceptionHandler exception_handler_;
   HandlerWithResponse pre_routing_handler_;
   Handler post_routing_handler_;
   HandlerWithResponse pre_request_handler_;
   Expect100ContinueHandler expect_100_continue_handler_;
+  StartHandler start_handler_;
 
   mutable std::mutex logger_mutex_;
   Logger logger_;
@@ -1552,25 +2387,17 @@ public:
       : res_(std::move(res)), err_(err),
         request_headers_(std::move(request_headers)), ssl_error_(ssl_error) {}
   Result(std::unique_ptr<Response> &&res, Error err, Headers &&request_headers,
-         int ssl_error, unsigned long ssl_backend_error)
+         int ssl_error, uint64_t ssl_backend_error)
       : res_(std::move(res)), err_(err),
         request_headers_(std::move(request_headers)), ssl_error_(ssl_error),
         ssl_backend_error_(ssl_backend_error) {}
 
   int ssl_error() const { return ssl_error_; }
-  unsigned long ssl_backend_error() const { return ssl_backend_error_; }
+  uint64_t ssl_backend_error() const { return ssl_backend_error_; }
 
 private:
   int ssl_error_ = 0;
-  unsigned long ssl_backend_error_ = 0;
-#endif
-
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-public:
-  [[deprecated("Use ssl_backend_error() instead")]]
-  unsigned long ssl_openssl_error() const {
-    return ssl_backend_error_;
-  }
+  uint64_t ssl_backend_error_ = 0;
 #endif
 };
 
@@ -1643,6 +2470,31 @@ inline ssize_t read_body_content(Stream *stream, BodyReader &br, char *buf,
 
 class decompressor;
 
+enum class NoProxyKind {
+  Wildcard,       // "*"
+  HostnameSuffix, // "example.com" or ".example.com"
+  IPv4Cidr,       // "10.0.0.0/8" (or single IP, treated as /32)
+  IPv6Cidr,       // "fe80::/10" (or single IP, treated as /128)
+};
+
+// Unified 16-byte buffer holding either a v4 (first 4 bytes) or v6 address.
+// Lets one CIDR matcher cover both families.
+using IPBytes = std::array<uint8_t, 16>;
+
+struct NoProxyEntry {
+  NoProxyKind kind = NoProxyKind::Wildcard;
+  std::string hostname_pattern; // lowercased, leading/trailing dot stripped
+  IPBytes net{};
+  int prefix_bits = 0;
+};
+
+struct NormalizedTarget {
+  std::string hostname; // lowercase; brackets and trailing dot removed
+  bool is_ipv4 = false;
+  bool is_ipv6 = false;
+  IPBytes ip{};
+};
+
 } // namespace detail
 
 class ClientImpl {
@@ -1704,6 +2556,7 @@ public:
   Result Get(const std::string &path, const Headers &headers, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Headers &headers, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Headers &headers, ResponseHandler response_handler, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
+  Result Get(const std::string &path, const Params &params, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Params &params, const Headers &headers, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Params &params, const Headers &headers, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Params &params, const Headers &headers, ResponseHandler response_handler, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
@@ -1859,6 +2712,7 @@ public:
   void set_proxy_basic_auth(const std::string &username,
                             const std::string &password);
   void set_proxy_bearer_token_auth(const std::string &token);
+  void set_no_proxy(const std::vector<std::string> &patterns);
 
   void set_logger(Logger logger);
   void set_error_logger(ErrorLogger error_logger);
@@ -1879,17 +2733,24 @@ protected:
 
   virtual bool create_and_connect_socket(Socket &socket, Error &error);
   virtual bool ensure_socket_connection(Socket &socket, Error &error);
+  virtual bool setup_proxy_connection(
+      Socket &socket,
+      std::chrono::time_point<std::chrono::steady_clock> start_time,
+      Response &res, bool &success, Error &error);
+
+  bool is_proxy_enabled_for_host(const std::string &host) const;
 
   // All of:
   //   shutdown_ssl
   //   shutdown_socket
   //   close_socket
-  // should ONLY be called when socket_mutex_ is locked.
-  // Also, shutdown_ssl and close_socket should also NOT be called concurrently
-  // with a DIFFERENT thread sending requests using that socket.
+  //   disconnect
+  // should ONLY be called when socket_mutex_ is locked, and only when
+  // no other thread is using the socket.
   virtual void shutdown_ssl(Socket &socket, bool shutdown_gracefully);
   void shutdown_socket(Socket &socket) const;
   void close_socket(Socket &socket);
+  void disconnect(bool gracefully);
 
   bool process_request(Stream &strm, Request &req, Response &res,
                        bool close_connection, Error &error);
@@ -1916,7 +2777,8 @@ protected:
   std::thread::id socket_requests_are_from_thread_ = std::thread::id();
   bool socket_should_be_closed_when_request_is_done_ = false;
 
-  // Hostname-IP map
+  // Hostname to connection target map. The value is an IP literal or another
+  // hostname; only the connection target changes, never the identity.
   std::map<std::string, std::string> addr_map_;
 
   // Default headers
@@ -1966,6 +2828,11 @@ protected:
   std::string proxy_basic_auth_username_;
   std::string proxy_basic_auth_password_;
   std::string proxy_bearer_token_auth_token_;
+
+  std::vector<detail::NoProxyEntry> no_proxy_entries_;
+
+  mutable detail::NormalizedTarget host_normalized_;
+  mutable bool host_normalized_valid_ = false;
 
   mutable std::mutex logger_mutex_;
   Logger logger_;
@@ -2026,6 +2893,7 @@ public:
                         const std::string &ca_cert_dir_path = std::string());
   void enable_server_certificate_verification(bool enabled);
   void enable_server_hostname_verification(bool enabled);
+  void enable_system_ca(bool enabled);
 
 protected:
   std::string digest_auth_username_;
@@ -2036,22 +2904,10 @@ protected:
   std::string ca_cert_dir_path_;
   bool server_certificate_verification_ = true;
   bool server_hostname_verification_ = true;
+  SystemCAMode system_ca_mode_ = SystemCAMode::Auto;
   std::string ca_cert_pem_; // Store CA cert PEM for redirect transfer
   int last_ssl_error_ = 0;
-  unsigned long last_backend_error_ = 0;
-#endif
-
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-public:
-  [[deprecated("Use load_ca_cert_store() instead")]]
-  void set_ca_cert_store(X509_STORE *ca_cert_store);
-
-  [[deprecated("Use tls::create_ca_store() instead")]]
-  X509_STORE *create_ca_cert_store(const char *ca_cert, std::size_t size) const;
-
-  [[deprecated("Use set_server_certificate_verifier(VerifyCallback) instead")]]
-  virtual void set_server_certificate_verifier(
-      std::function<SSLVerifierResponse(SSL *ssl)> verifier);
+  uint64_t last_backend_error_ = 0;
 #endif
 };
 
@@ -2085,6 +2941,7 @@ public:
   Result Get(const std::string &path, const Headers &headers, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Headers &headers, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Headers &headers, ResponseHandler response_handler, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
+  Result Get(const std::string &path, const Params &params, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Params &params, const Headers &headers, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Params &params, const Headers &headers, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
   Result Get(const std::string &path, const Params &params, const Headers &headers, ResponseHandler response_handler, ContentReceiver content_receiver, DownloadProgress progress = nullptr);
@@ -2227,7 +3084,6 @@ public:
   void set_follow_location(bool on);
 
   void set_path_encode(bool on);
-  void set_url_encode(bool on);
 
   void set_compress(bool on);
 
@@ -2241,6 +3097,7 @@ public:
   void set_proxy_basic_auth(const std::string &username,
                             const std::string &password);
   void set_proxy_bearer_token_auth(const std::string &token);
+  void set_no_proxy(const std::vector<std::string> &patterns);
   void set_logger(Logger logger);
   void set_error_logger(ErrorLogger error_logger);
 
@@ -2255,6 +3112,7 @@ public:
                              const std::string &password);
   void enable_server_certificate_verification(bool enabled);
   void enable_server_hostname_verification(bool enabled);
+  void enable_system_ca(bool enabled);
   void set_ca_cert_path(const std::string &ca_cert_file_path,
                         const std::string &ca_cert_dir_path = std::string());
 
@@ -2268,26 +3126,12 @@ public:
 
   tls::ctx_t tls_context() const;
 
-#if defined(_WIN32) &&                                                         \
-    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#ifdef CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
   void enable_windows_certificate_verification(bool enabled);
 #endif
 
 private:
   bool is_ssl_ = false;
-#endif
-
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-public:
-  [[deprecated("Use tls_context() instead")]]
-  SSL_CTX *ssl_context() const;
-
-  [[deprecated("Use set_session_verifier(session_t) instead")]]
-  void set_server_certificate_verifier(
-      std::function<SSLVerifierResponse(SSL *ssl)> verifier);
-
-  [[deprecated("Use Result::ssl_backend_error() instead")]]
-  long get_verify_result() const;
 #endif
 };
 
@@ -2334,25 +3178,6 @@ private:
   std::mutex ctx_mutex_;
 
   int last_ssl_error_ = 0;
-
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-public:
-  [[deprecated("Use SSLServer(PemMemory) or "
-               "SSLServer(ContextSetupCallback) instead")]]
-  SSLServer(X509 *cert, EVP_PKEY *private_key,
-            X509_STORE *client_ca_cert_store = nullptr);
-
-  [[deprecated("Use SSLServer(ContextSetupCallback) instead")]]
-  SSLServer(
-      const std::function<bool(SSL_CTX &ssl_ctx)> &setup_ssl_ctx_callback);
-
-  [[deprecated("Use tls_context() instead")]]
-  SSL_CTX *ssl_context() const;
-
-  [[deprecated("Use update_certs_pem() instead")]]
-  void update_certs(X509 *cert, EVP_PKEY *private_key,
-                    X509_STORE *client_ca_cert_store = nullptr);
-#endif
 };
 
 class SSLClient final : public ClientImpl {
@@ -2390,8 +3215,7 @@ public:
 
   tls::ctx_t tls_context() const { return ctx_; }
 
-#if defined(_WIN32) &&                                                         \
-    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#ifdef CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
   void enable_windows_certificate_verification(bool enabled);
 #endif
 
@@ -2407,11 +3231,18 @@ private:
                  std::function<bool(Stream &strm)> callback) override;
   bool is_ssl() const override;
 
+  bool setup_proxy_connection(
+      Socket &socket,
+      std::chrono::time_point<std::chrono::steady_clock> start_time,
+      Response &res, bool &success, Error &error) override;
   bool connect_with_proxy(
       Socket &sock,
       std::chrono::time_point<std::chrono::steady_clock> start_time,
       Response &res, bool &success, Error &error);
   bool initialize_ssl(Socket &socket, Error &error);
+
+  void init_ctx();
+  void reset_ctx_on_error();
 
   bool load_certs();
 
@@ -2419,39 +3250,18 @@ private:
   std::mutex ctx_mutex_;
   std::once_flag initialize_cert_;
 
-  long verify_result_ = 0;
+  // Tracks whether a custom CA store was applied via set_ca_cert_store(),
+  // since the store handle itself is owned by ctx_ and leaves no other trace.
+  // Used to keep custom CA configuration exclusive with system CA loading.
+  bool ca_cert_store_set_ = false;
 
   std::function<SSLVerifierResponse(tls::session_t)> session_verifier_;
 
-#if defined(_WIN32) &&                                                         \
-    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#ifdef CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
   bool enable_windows_cert_verification_ = true;
 #endif
 
   friend class ClientImpl;
-
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-public:
-  [[deprecated("Use SSLClient(host, port, PemMemory) instead")]]
-  explicit SSLClient(const std::string &host, int port, X509 *client_cert,
-                     EVP_PKEY *client_key,
-                     const std::string &private_key_password = std::string());
-
-  [[deprecated("Use Result::ssl_backend_error() instead")]]
-  long get_verify_result() const;
-
-  [[deprecated("Use tls_context() instead")]]
-  SSL_CTX *ssl_context() const;
-
-  [[deprecated("Use set_session_verifier(session_t) instead")]]
-  void set_server_certificate_verifier(
-      std::function<SSLVerifierResponse(SSL *ssl)> verifier) override;
-
-private:
-  bool verify_host(X509 *server_cert) const;
-  bool verify_host_with_subject_alt_name(X509 *server_cert) const;
-  bool verify_host_with_common_name(X509 *server_cert) const;
-#endif
 };
 #endif // CPPHTTPLIB_SSL_ENABLED
 
@@ -2471,9 +3281,7 @@ template <size_t N> inline constexpr size_t str_len(const char (&)[N]) {
 }
 
 inline bool is_numeric(const std::string &str) {
-  return !str.empty() &&
-         std::all_of(str.cbegin(), str.cend(),
-                     [](unsigned char c) { return std::isdigit(c); });
+  return !str.empty() && std::all_of(str.cbegin(), str.cend(), is_ascii_digit);
 }
 
 inline size_t get_header_value_u64(const Headers &headers,
@@ -2485,7 +3293,18 @@ inline size_t get_header_value_u64(const Headers &headers,
   std::advance(it, static_cast<ssize_t>(id));
   if (it != rng.second) {
     if (is_numeric(it->second)) {
-      return std::strtoull(it->second.data(), nullptr, 10);
+      // Parse at size_t width so an out-of-range Content-Length is reported
+      // rather than silently saturated/truncated (a value above 2^32 would
+      // otherwise wrap to a small framing length on 32-bit builds). Flag it
+      // and return SIZE_MAX so the existing oversized-value guards reject it.
+      size_t val = 0;
+      const auto &s = it->second;
+      auto r = from_chars(s.data(), s.data() + s.size(), val);
+      if (r.ec == std::errc::result_out_of_range) {
+        is_invalid_value = true;
+        return (std::numeric_limits<size_t>::max)();
+      }
+      return val;
     } else {
       is_invalid_value = true;
     }
@@ -2607,6 +3426,8 @@ std::string encode_query_component(const std::string &component,
 std::string decode_query_component(const std::string &component,
                                    bool plus_as_space = true);
 
+std::string sanitize_filename(const std::string &filename);
+
 std::string append_query_params(const std::string &path, const Params &params);
 
 std::pair<std::string, std::string> make_range_header(const Ranges &ranges);
@@ -2656,6 +3477,10 @@ private:
 
 std::string make_host_and_port_string(const std::string &host, int port,
                                       bool is_ssl);
+
+template <typename T>
+bool check_and_write_headers(Stream &strm, Headers &headers, T header_writer,
+                             Error &error);
 
 std::string trim_copy(const std::string &s);
 
@@ -2708,8 +3533,6 @@ bool parse_range_header(const std::string &s, Ranges &ranges);
 
 bool parse_accept_header(const std::string &s,
                          std::vector<std::string> &content_types);
-
-int close_socket(socket_t sock);
 
 ssize_t send_socket(socket_t sock, const void *ptr, size_t size, int flags);
 
@@ -2869,6 +3692,7 @@ public:
 
 private:
   void append(char c);
+  void append(const char *data, size_t size);
 
   Stream &strm_;
   char *fixed_buffer_;
@@ -2931,6 +3755,7 @@ bool is_obs_text(char c);
 bool is_field_vchar(char c);
 bool is_field_content(const std::string &s);
 bool is_field_value(const std::string &s);
+bool is_field_valid(const std::string &name, const std::string &value);
 
 } // namespace fields
 } // namespace detail
@@ -2950,8 +3775,11 @@ namespace impl {
 // setup callbacks (cast ctx_t to tls::impl::MbedTlsContext*).
 struct MbedTlsContext {
   mbedtls_ssl_config conf;
+#ifndef CPPHTTPLIB_MBEDTLS_V4
+  // Mbed TLS 4.x uses PSA Crypto's internal RNG; no explicit entropy/DRBG.
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context ctr_drbg;
+#endif
   mbedtls_x509_crt ca_chain;
   mbedtls_x509_crt own_cert;
   mbedtls_pk_context own_key;
@@ -2964,6 +3792,36 @@ struct MbedTlsContext {
 
   MbedTlsContext(const MbedTlsContext &) = delete;
   MbedTlsContext &operator=(const MbedTlsContext &) = delete;
+};
+
+} // namespace impl
+} // namespace tls
+#endif
+
+#ifdef CPPHTTPLIB_WOLFSSL_SUPPORT
+namespace tls {
+namespace impl {
+
+// wolfSSL context wrapper (holds WOLFSSL_CTX and related state).
+// This struct is accessible via tls::impl for use in SSL context
+// setup callbacks (cast ctx_t to tls::impl::WolfSSLContext*).
+struct WolfSSLContext {
+  WOLFSSL_CTX *ctx = nullptr;
+  bool is_server = false;
+  bool verify_client = false;
+  bool has_verify_callback = false;
+  std::string ca_pem_data_; // accumulated PEM for get_ca_names/get_ca_certs
+
+  WolfSSLContext();
+  ~WolfSSLContext();
+
+  WolfSSLContext(const WolfSSLContext &) = delete;
+  WolfSSLContext &operator=(const WolfSSLContext &) = delete;
+};
+
+// CA store for wolfSSL: holds raw PEM bytes to allow reloading into any ctx
+struct WolfSSLCAStore {
+  std::string pem_data;
 };
 
 } // namespace impl
@@ -3289,6 +4147,9 @@ public:
   SSEClient &set_reconnect_interval(int ms);
   SSEClient &set_max_reconnect_attempts(int n);
 
+  // Update headers (thread-safe)
+  SSEClient &set_headers(const Headers &headers);
+
   // State accessors
   bool is_connected() const;
   const std::string &last_event_id() const;
@@ -3313,6 +4174,7 @@ private:
   Client &client_;
   std::string path_;
   Headers headers_;
+  mutable std::mutex headers_mutex_;
 
   // Callbacks
   MessageHandler on_message_;
@@ -3334,6 +4196,274 @@ private:
 };
 
 } // namespace sse
+
+namespace ws {
+
+enum class Opcode : uint8_t {
+  Continuation = 0x0,
+  Text = 0x1,
+  Binary = 0x2,
+  Close = 0x8,
+  Ping = 0x9,
+  Pong = 0xA,
+};
+
+enum class CloseStatus : uint16_t {
+  Normal = 1000,
+  GoingAway = 1001,
+  ProtocolError = 1002,
+  UnsupportedData = 1003,
+  NoStatus = 1005,
+  Abnormal = 1006,
+  InvalidPayload = 1007,
+  PolicyViolation = 1008,
+  MessageTooBig = 1009,
+  MandatoryExtension = 1010,
+  InternalError = 1011,
+};
+
+enum ReadResult : int { Fail = 0, Text = 1, Binary = 2 };
+
+// Result of WebSocketClient::connect(). Truthy only when the WebSocket
+// upgrade handshake fully succeeded. On failure error() identifies the
+// failing layer; status()/headers() expose the server's upgrade response
+// when one was received (status() is -1 otherwise).
+class Result {
+public:
+  Result() = default;
+  Result(Error err, int status, Headers &&headers)
+      : err_(err), status_(status), headers_(std::move(headers)) {}
+
+  explicit operator bool() const { return err_ == Error::Success; }
+  Error error() const { return err_; }
+
+  // Upgrade response info
+  int status() const { return status_; }
+  const Headers &headers() const { return headers_; }
+  std::string get_header_value(const std::string &key,
+                               const char *def = "") const {
+    return detail::get_header_value(headers_, key, def, 0);
+  }
+  bool has_header(const std::string &key) const {
+    return headers_.find(key) != headers_.end();
+  }
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+  Result(Error err, int status, Headers &&headers, int ssl_error,
+         uint64_t ssl_backend_error)
+      : err_(err), status_(status), headers_(std::move(headers)),
+        ssl_error_(ssl_error), ssl_backend_error_(ssl_backend_error) {}
+
+  int ssl_error() const { return ssl_error_; }
+  uint64_t ssl_backend_error() const { return ssl_backend_error_; }
+#endif
+
+private:
+  Error err_ = Error::Unknown; // a default-constructed Result is falsy
+  int status_ = -1;
+  Headers headers_;
+#ifdef CPPHTTPLIB_SSL_ENABLED
+  int ssl_error_ = 0;
+  uint64_t ssl_backend_error_ = 0;
+#endif
+};
+
+class WebSocket {
+public:
+  WebSocket(const WebSocket &) = delete;
+  WebSocket &operator=(const WebSocket &) = delete;
+  ~WebSocket();
+
+  ReadResult read(std::string &msg);
+  bool send(const std::string &data);
+  bool send(const char *data, size_t len);
+  void close(CloseStatus status = CloseStatus::Normal,
+             const std::string &reason = "");
+  const Request &request() const;
+  bool is_open() const;
+
+private:
+  friend class httplib::Server;
+  friend class WebSocketClient;
+
+  WebSocket(
+      Stream &strm, const Request &req, bool is_server,
+      time_t ping_interval_sec = CPPHTTPLIB_WEBSOCKET_PING_INTERVAL_SECOND,
+      int max_missed_pongs = CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS)
+      : strm_(strm), req_(req), is_server_(is_server),
+        ping_interval_sec_(ping_interval_sec),
+        max_missed_pongs_(max_missed_pongs) {
+    start_heartbeat();
+  }
+
+  WebSocket(
+      std::unique_ptr<Stream> &&owned_strm, const Request &req, bool is_server,
+      time_t ping_interval_sec = CPPHTTPLIB_WEBSOCKET_PING_INTERVAL_SECOND,
+      int max_missed_pongs = CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS)
+      : strm_(*owned_strm), owned_strm_(std::move(owned_strm)), req_(req),
+        is_server_(is_server), ping_interval_sec_(ping_interval_sec),
+        max_missed_pongs_(max_missed_pongs) {
+    start_heartbeat();
+  }
+
+  void start_heartbeat();
+  bool send_frame(Opcode op, const char *data, size_t len, bool fin = true);
+
+  Stream &strm_;
+  std::unique_ptr<Stream> owned_strm_;
+  Request req_;
+  bool is_server_;
+  time_t ping_interval_sec_;
+  int max_missed_pongs_;
+  int unacked_pings_ = 0;
+  std::atomic<bool> closed_{false};
+  std::mutex write_mutex_;
+  std::thread ping_thread_;
+  std::mutex ping_mutex_;
+  std::condition_variable ping_cv_;
+};
+
+class WebSocketClient {
+public:
+  explicit WebSocketClient(const std::string &scheme_host_port_path,
+                           const Headers &headers = {});
+
+  ~WebSocketClient();
+  WebSocketClient(const WebSocketClient &) = delete;
+  WebSocketClient &operator=(const WebSocketClient &) = delete;
+
+  bool is_valid() const;
+
+  Result connect();
+  ReadResult read(std::string &msg);
+  bool send(const std::string &data);
+  bool send(const char *data, size_t len);
+  void close(CloseStatus status = CloseStatus::Normal,
+             const std::string &reason = "");
+  bool is_open() const;
+  const std::string &subprotocol() const;
+  void set_read_timeout(time_t sec, time_t usec = 0);
+  template <class Rep, class Period>
+  void set_read_timeout(const std::chrono::duration<Rep, Period> &duration);
+
+  void set_write_timeout(time_t sec, time_t usec = 0);
+  template <class Rep, class Period>
+  void set_write_timeout(const std::chrono::duration<Rep, Period> &duration);
+
+  void set_websocket_ping_interval(time_t sec);
+  void set_websocket_max_missed_pongs(int count);
+  void set_tcp_nodelay(bool on);
+  void set_address_family(int family);
+  void set_ipv6_v6only(bool on);
+  void set_socket_options(SocketOptions socket_options);
+
+  void set_connection_timeout(time_t sec, time_t usec = 0);
+  template <class Rep, class Period>
+  void
+  set_connection_timeout(const std::chrono::duration<Rep, Period> &duration);
+
+  void set_interface(const std::string &intf);
+  void set_hostname_addr_map(std::map<std::string, std::string> addr_map);
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+  struct PemMemory {
+    const char *cert_pem;
+    size_t cert_pem_len;
+    const char *key_pem;
+    size_t key_pem_len;
+    const char *private_key_password;
+  };
+  explicit WebSocketClient(const std::string &scheme_host_port_path,
+                           const PemMemory &pem, const Headers &headers = {});
+
+  void set_ca_cert_path(const std::string &ca_cert_file_path,
+                        const std::string &ca_cert_dir_path = std::string());
+  void set_ca_cert_store(tls::ca_store_t store);
+  void load_ca_cert_store(const char *ca_cert, std::size_t size);
+  void enable_server_certificate_verification(bool enabled);
+  void enable_server_hostname_verification(bool enabled);
+  void enable_system_ca(bool enabled);
+#endif
+
+private:
+  void shutdown_and_close();
+  bool create_stream(std::unique_ptr<Stream> &strm, Error &error,
+                     int &ssl_error, uint64_t &ssl_backend_error);
+  void prepare_default_headers(Request &req);
+
+  std::string host_;
+  int port_;
+  std::string path_;
+  Headers headers_;
+  std::string subprotocol_;
+  bool is_valid_ = false;
+  socket_t sock_ = INVALID_SOCKET;
+  std::unique_ptr<WebSocket> ws_;
+  time_t read_timeout_sec_ = CPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND;
+  time_t read_timeout_usec_ = 0;
+  time_t write_timeout_sec_ = CPPHTTPLIB_CLIENT_WRITE_TIMEOUT_SECOND;
+  time_t write_timeout_usec_ = CPPHTTPLIB_CLIENT_WRITE_TIMEOUT_USECOND;
+  time_t websocket_ping_interval_sec_ =
+      CPPHTTPLIB_WEBSOCKET_PING_INTERVAL_SECOND;
+  int websocket_max_missed_pongs_ = CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS;
+  int address_family_ = AF_UNSPEC;
+  bool tcp_nodelay_ = CPPHTTPLIB_TCP_NODELAY;
+  bool ipv6_v6only_ = CPPHTTPLIB_IPV6_V6ONLY;
+  SocketOptions socket_options_ = nullptr;
+  time_t connection_timeout_sec_ = CPPHTTPLIB_CONNECTION_TIMEOUT_SECOND;
+  time_t connection_timeout_usec_ = CPPHTTPLIB_CONNECTION_TIMEOUT_USECOND;
+  std::string interface_;
+
+  // Hostname to connection target map. The value is an IP literal or another
+  // hostname; only the connection target changes, never the identity.
+  std::map<std::string, std::string> addr_map_;
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+  bool is_ssl_ = false;
+  tls::ctx_t tls_ctx_ = nullptr;
+  tls::session_t tls_session_ = nullptr;
+  std::string ca_cert_file_path_;
+  std::string ca_cert_dir_path_;
+  bool custom_ca_loaded_ = false;
+  bool certs_loaded_ = false;
+  SystemCAMode system_ca_mode_ = SystemCAMode::Auto;
+  bool server_certificate_verification_ = true;
+  bool server_hostname_verification_ = true;
+#endif
+};
+
+template <class Rep, class Period>
+inline void WebSocketClient::set_read_timeout(
+    const std::chrono::duration<Rep, Period> &duration) {
+  detail::duration_to_sec_and_usec(
+      duration, [&](time_t sec, time_t usec) { set_read_timeout(sec, usec); });
+}
+
+template <class Rep, class Period>
+inline void WebSocketClient::set_write_timeout(
+    const std::chrono::duration<Rep, Period> &duration) {
+  detail::duration_to_sec_and_usec(
+      duration, [&](time_t sec, time_t usec) { set_write_timeout(sec, usec); });
+}
+
+template <class Rep, class Period>
+inline void WebSocketClient::set_connection_timeout(
+    const std::chrono::duration<Rep, Period> &duration) {
+  detail::duration_to_sec_and_usec(duration, [&](time_t sec, time_t usec) {
+    set_connection_timeout(sec, usec);
+  });
+}
+
+namespace impl {
+
+bool is_valid_utf8(const std::string &s);
+
+bool read_websocket_frame(Stream &strm, Opcode &opcode, std::string &payload,
+                          bool &fin, bool expect_masked, size_t max_len);
+
+} // namespace impl
+
+} // namespace ws
 
 
 } // namespace httplib
